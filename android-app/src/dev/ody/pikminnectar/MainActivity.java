@@ -19,7 +19,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.nio.charset.StandardCharsets;
 import java.text.SimpleDateFormat;
 import java.util.Date;
@@ -42,6 +44,10 @@ public final class MainActivity extends Activity {
     private TextView logText;
     private boolean binding;
     private boolean destroyed;
+    private Process rootProcess;
+    private BufferedReader rootReader;
+    private BufferedWriter rootWriter;
+    private long rootCommandId;
 
     private final Runnable refreshLoop = new Runnable() {
         @Override public void run() {
@@ -61,6 +67,7 @@ public final class MainActivity extends Activity {
         destroyed = true;
         handler.removeCallbacksAndMessages(null);
         worker.shutdownNow();
+        closeRootShell();
         super.onDestroy();
     }
 
@@ -241,15 +248,43 @@ public final class MainActivity extends Activity {
         return value;
     }
 
-    private String execRoot(String command) throws Exception {
-        Process process = new ProcessBuilder("su", "-mm", "-c", command).redirectErrorStream(true).start();
+    private synchronized String execRoot(String command) throws Exception {
+        ensureRootShell();
+        String marker = "__NECTAR_DONE_" + (++rootCommandId) + "_" + System.nanoTime() + "__";
+        rootWriter.write(command);
+        rootWriter.newLine();
+        rootWriter.write("__nectar_status=$?; printf '\\n%s:%s\\n' '" + marker + "' \"$__nectar_status\"");
+        rootWriter.newLine();
+        rootWriter.flush();
         StringBuilder output = new StringBuilder();
-        try (BufferedReader reader = new BufferedReader(new InputStreamReader(process.getInputStream(), StandardCharsets.UTF_8))) {
-            String line; while ((line = reader.readLine()) != null) output.append(line).append('\n');
+        String line;
+        while ((line = rootReader.readLine()) != null) {
+            if (line.startsWith(marker + ":")) {
+                int code = Integer.parseInt(line.substring(marker.length() + 1));
+                if (code != 0) throw new IllegalStateException("su exit " + code + ": " + output.toString().trim());
+                return output.toString();
+            }
+            output.append(line).append('\n');
         }
-        int code = process.waitFor();
-        if (code != 0) throw new IllegalStateException("su exit " + code + ": " + output.toString().trim());
-        return output.toString();
+        closeRootShell();
+        throw new IllegalStateException("root shell unexpectedly closed");
+    }
+
+    private void ensureRootShell() throws Exception {
+        if (rootProcess != null && rootProcess.isAlive()) return;
+        closeRootShell();
+        rootProcess = new ProcessBuilder("su", "-mm").redirectErrorStream(true).start();
+        rootReader = new BufferedReader(new InputStreamReader(rootProcess.getInputStream(), StandardCharsets.UTF_8));
+        rootWriter = new BufferedWriter(new OutputStreamWriter(rootProcess.getOutputStream(), StandardCharsets.UTF_8));
+    }
+
+    private synchronized void closeRootShell() {
+        try { if (rootWriter != null) rootWriter.close(); } catch (Exception ignored) {}
+        try { if (rootReader != null) rootReader.close(); } catch (Exception ignored) {}
+        if (rootProcess != null) rootProcess.destroy();
+        rootWriter = null;
+        rootReader = null;
+        rootProcess = null;
     }
 
     private LinearLayout card() {

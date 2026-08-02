@@ -15,7 +15,7 @@
 
 1. 從 [`dist/pikmin-nectar-rpc-v150.zip`](dist/pikmin-nectar-rpc-v150.zip) 安裝 Magisk 模組並重新開機。
 2. 安裝 [`dist/pikmin-nectar-control.apk`](dist/pikmin-nectar-control.apk)。
-3. 第一次開啟控制 App 時允許 Magisk root 權限。
+3. 第一次開啟控制 App 時允許 Magisk root 權限。App 會維持單一 root shell，正常使用期間不會因每次狀態刷新而重複顯示授權提示。
 4. 開啟 Pikmin Bloom，停留在散步地圖並開始種花。
 5. 回到控制 App，確認 GPS、種花、網路及 RPC 均顯示就緒，再打開「自動領取範圍內大花精華」。
 
