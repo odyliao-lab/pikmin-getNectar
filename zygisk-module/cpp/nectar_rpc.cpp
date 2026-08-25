@@ -63,6 +63,7 @@ using DomainGet = void *(*)();
 using DomainGetAssemblies = const void **(*)(void *, size_t *);
 using AssemblyGetImage = void *(*)(const void *);
 using ClassFromName = void *(*)(void *, const char *, const char *);
+using ClassGetMethodFromName = void *(*)(void *, const char *, int);
 using ObjectNew = void *(*)(void *);
 using StringNew = void *(*)(const char *);
 using GcHandleNew = uint32_t (*)(void *, bool);
@@ -76,6 +77,14 @@ using RequestConstructor = void (*)(void *, void *);
 using RequestSetString = void (*)(void *, void *, void *);
 using RequestSetBool = void (*)(void *, bool, void *);
 using SendClaim = void *(*)(void *, void *, void *, int, void *);
+using CompletePikminTask = void *(*)(void *, void *, bool, void *);
+
+struct Il2CppStringLayout {
+    void *klass;
+    void *monitor;
+    int32_t length;
+    char16_t chars[1];
+};
 
 struct FlowerRecord {
     double latitude{};
@@ -92,6 +101,7 @@ DomainGet domain_get{};
 DomainGetAssemblies domain_get_assemblies{};
 AssemblyGetImage assembly_get_image{};
 ClassFromName class_from_name{};
+ClassGetMethodFromName class_get_method_from_name{};
 ObjectNew object_new{};
 StringNew string_new{};
 GcHandleNew gchandle_new{};
@@ -111,6 +121,7 @@ RequestConstructor request_constructor{};
 RequestSetString request_set_map_object_id{};
 RequestSetBool request_set_include_failure{};
 SendClaim send_claim{};
+CompletePikminTask original_complete_pikmin_task{};
 TaskBool task_is_completed{};
 TaskBool task_is_faulted{};
 void *request_class{};
@@ -124,6 +135,7 @@ char target_path[512]{};
 char status_path[512]{};
 char claim_log_path[512]{};
 char system_gps_path[512]{};
+char return_trace_path[512]{};
 std::map<std::string, FlowerRecord> flowers;
 std::map<std::string, std::string> last_flower_state;
 long long last_tick_ms{};
@@ -138,6 +150,75 @@ double pending_gps_lat{};
 double pending_gps_lng{};
 double pending_distance{};
 std::string last_result = "none";
+
+long long now_ms();
+
+std::string utf8_string(void *value) {
+    if (!value) return {};
+    const auto *text = static_cast<Il2CppStringLayout *>(value);
+    if (text->length < 1 || text->length > 256) return {};
+    std::string result;
+    result.reserve(static_cast<size_t>(text->length));
+    for (int index = 0; index < text->length; ++index) {
+        const char16_t c = text->chars[index];
+        if (c < 0x80) result.push_back(static_cast<char>(c));
+        else result.push_back('?');
+    }
+    return result;
+}
+
+void append_return_trace(const char *event, void *self, void *task_id) {
+    const std::string id = utf8_string(task_id);
+    LOGI("[RETURN-DIAG] %s self=%p taskId=%s", event, self, id.c_str());
+    FILE *file = std::fopen(return_trace_path, "a");
+    if (!file) return;
+    std::fprintf(file, "%lld\t%s\t%p\t%s\n", now_ms(), event, self, id.c_str());
+    std::fclose(file);
+    chmod(return_trace_path, 0644);
+}
+
+void *hooked_complete_pikmin_task(void *self, void *task_id, bool discard_postcard, void *method_info) {
+    append_return_trace(discard_postcard ? "manual-discard-postcard" : "manual-keep-postcard", self, task_id);
+    return original_complete_pikmin_task
+            ? original_complete_pikmin_task(self, task_id, discard_postcard, method_info) : nullptr;
+}
+
+void *find_class(const char *namespc, const char *name) {
+    if (!domain_get || !domain_get_assemblies || !assembly_get_image || !class_from_name) return nullptr;
+    size_t count{};
+    const void **assemblies = domain_get_assemblies(domain_get(), &count);
+    for (size_t index = 0; assemblies && index < count; ++index) {
+        void *klass = class_from_name(assembly_get_image(assemblies[index]), namespc, name);
+        if (klass) return klass;
+    }
+    return nullptr;
+}
+
+void install_return_diagnostic_hook() {
+    if (!class_get_method_from_name) {
+        LOGE("[RETURN-DIAG] il2cpp_class_get_method_from_name unavailable");
+        return;
+    }
+    void *klass = find_class("Niantic.Ichigo.Game.PikminTasks", "PikminTaskActionManager");
+    if (!klass) {
+        LOGE("[RETURN-DIAG] PikminTaskActionManager class not found");
+        return;
+    }
+    // This is the public overload that contains both the task id and postcard policy.
+    void *method = class_get_method_from_name(klass, "CompletePikminTaskAsync", 2);
+    if (!method) {
+        LOGE("[RETURN-DIAG] CompletePikminTaskAsync(taskId, discardPostcard) not found");
+        return;
+    }
+    void *entry = *reinterpret_cast<void **>(method);
+    if (!entry) {
+        LOGE("[RETURN-DIAG] CompletePikminTaskAsync has no native entry point");
+        return;
+    }
+    A64HookFunction(entry, reinterpret_cast<void *>(hooked_complete_pikmin_task),
+                    reinterpret_cast<void **>(&original_complete_pikmin_task));
+    LOGI("[RETURN-DIAG] hook installed method=%p entry=%p", method, entry);
+}
 
 long long now_ms() {
     timespec value{};
@@ -573,6 +654,8 @@ void start(const char *game_data_dir) {
     domain_get_assemblies = reinterpret_cast<DomainGetAssemblies>(xdl_sym(handle, "il2cpp_domain_get_assemblies", nullptr));
     assembly_get_image = reinterpret_cast<AssemblyGetImage>(xdl_sym(handle, "il2cpp_assembly_get_image", nullptr));
     class_from_name = reinterpret_cast<ClassFromName>(xdl_sym(handle, "il2cpp_class_from_name", nullptr));
+    class_get_method_from_name = reinterpret_cast<ClassGetMethodFromName>(
+            xdl_sym(handle, "il2cpp_class_get_method_from_name", nullptr));
     object_new = reinterpret_cast<ObjectNew>(xdl_sym(handle, "il2cpp_object_new", nullptr));
     string_new = reinterpret_cast<StringNew>(xdl_sym(handle, "il2cpp_string_new", nullptr));
     gchandle_new = reinterpret_cast<GcHandleNew>(xdl_sym(handle, "il2cpp_gchandle_new", nullptr));
@@ -589,6 +672,7 @@ void start(const char *game_data_dir) {
     std::snprintf(status_path, sizeof(status_path), "%s/files/nectar_status.tsv", game_data_dir);
     std::snprintf(claim_log_path, sizeof(claim_log_path), "%s/files/nectar_claims.tsv", game_data_dir);
     std::snprintf(system_gps_path, sizeof(system_gps_path), "%s/files/nectar_system_gps.tsv", game_data_dir);
+    std::snprintf(return_trace_path, sizeof(return_trace_path), "%s/files/return_rpc_trace.tsv", game_data_dir);
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);
@@ -611,6 +695,7 @@ void start(const char *game_data_dir) {
     install_hook(base, kPlantingStartRva, reinterpret_cast<void *>(hooked_planting_start), original_planting_start);
     install_hook(base, kPlantingStateUpdatedRva, reinterpret_cast<void *>(hooked_planting_state_updated), original_planting_state_updated);
     install_hook(base, kLocationControllerAwakeRva, reinterpret_cast<void *>(hooked_location_controller_awake), original_location_controller_awake);
+    install_return_diagnostic_hook();
     LOGI("[NECTAR] v151 RPC hooks installed base=%" PRIxPTR " mode=%s", base, mode_path);
 }
 
