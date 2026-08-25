@@ -4,16 +4,16 @@
 
 ## 相容性
 
-- Pikmin Bloom `150.0`
+- Pikmin Bloom `151.0`
 - Android `arm64-v8a`（實機測試：Android 13 / SDK 33）
 - Magisk 與 Zygisk
 - 控制 App 最低 Android 9（API 28）
 
-遊戲更新通常會改變 IL2CPP RVA；版本不是 150.0 時請不要安裝或啟用。使用 root、定位模擬或遊戲自動化可能違反服務條款，帳號與裝置風險由使用者自行承擔。
+遊戲更新通常會改變 IL2CPP RVA；版本不是 151.0 時請不要安裝或啟用。模組也會驗證 `libil2cpp.so` 檔案大小，不相符時不安裝 hooks。使用 root、定位模擬或遊戲自動化可能違反服務條款，帳號與裝置風險由使用者自行承擔。
 
 ## 安裝
 
-1. 從 [`dist/pikmin-nectar-rpc-v150.zip`](dist/pikmin-nectar-rpc-v150.zip) 安裝 Magisk 模組並重新開機。
+1. 從 [`dist/pikmin-nectar-rpc-v151.zip`](dist/pikmin-nectar-rpc-v151.zip) 安裝 Magisk 模組並重新開機。
 2. 安裝 [`dist/pikmin-nectar-control.apk`](dist/pikmin-nectar-control.apk)。
 3. 第一次開啟控制 App 時允許 Magisk root 權限。App 會維持單一 root shell，正常使用期間不會因每次狀態刷新而重複顯示授權提示。
 4. 開啟 Pikmin Bloom，停留在散步地圖並開始種花。

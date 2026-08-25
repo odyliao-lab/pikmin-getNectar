@@ -19,22 +19,24 @@
 
 namespace {
 
-constexpr uintptr_t kRegisterMapObjectRva = 0x590F914;
-constexpr uintptr_t kMapObjectManagerUpdateRva = 0x5911608;
-constexpr uintptr_t kGetFlowerProtoRva = 0x59221E8;
-constexpr uintptr_t kConstructProtoObjectRva = 0x5917270;
-constexpr uintptr_t kUpdateProtoObjectRva = 0x5912748;
-constexpr uintptr_t kFlowerModelUpdatedRva = 0x5922750;
-constexpr uintptr_t kRpcManagerConstructorRva = 0x71302D4;
-constexpr uintptr_t kRpcManagerLoggedInRva = 0x712FBC4;
-constexpr uintptr_t kPlantingInitRva = 0x5E0CD20;
-constexpr uintptr_t kPlantingStartRva = 0x5E0D310;
-constexpr uintptr_t kPlantingStateUpdatedRva = 0x5E0DCC0;
-constexpr uintptr_t kLocationControllerAwakeRva = 0x706D0F8;
-constexpr uintptr_t kRequestConstructorRva = 0x70F0AB8;
-constexpr uintptr_t kRequestSetMapObjectIdRva = 0x70F0CB0;
-constexpr uintptr_t kRequestSetIncludeFailureRva = 0x70F0D90;
-constexpr uintptr_t kSendClaimRva = 0x711F348;
+// Pikmin Bloom 151.0 / arm64-v8a. Regenerated from the installed APK's
+// libil2cpp.so plus global-metadata.dat; nonmatching binaries fail closed.
+constexpr off_t kExpectedIl2CppSize = 254191320;
+constexpr uintptr_t kRegisterMapObjectRva = 0x59E4ADC;
+constexpr uintptr_t kMapObjectManagerUpdateRva = 0x59E67D0;
+constexpr uintptr_t kFlowerModelUpdatedRva = 0x59F79E4;
+constexpr uintptr_t kRpcManagerConstructorRva = 0x721BE8C;
+constexpr uintptr_t kRpcManagerLoggedInRva = 0x721B788;
+constexpr uintptr_t kPlantingInitRva = 0x5EE1E44;
+constexpr uintptr_t kPlantingStartRva = 0x5EE1FB8;
+constexpr uintptr_t kPlantingStateUpdatedRva = 0x5EE27F4;
+constexpr uintptr_t kLocationControllerAwakeRva = 0x71576D8;
+constexpr uintptr_t kRequestConstructorRva = 0x71D2DE8;
+constexpr uintptr_t kRequestSetMapObjectIdRva = 0x71D2FE0;
+constexpr uintptr_t kRequestSetIncludeFailureRva = 0x71D30C0;
+constexpr uintptr_t kSendClaimRva = 0x720AF0C;
+constexpr uintptr_t kTaskIsCompletedRva = 0xC8EEDAC;
+constexpr uintptr_t kTaskIsFaultedRva = 0xC8F47C0;
 
 constexpr size_t kInitialMapObjectProtoOffset = 0x68;
 constexpr size_t kInteractionSettingsOffset = 0xA8;
@@ -572,14 +574,17 @@ void start(const char *game_data_dir) {
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);
     send_claim = reinterpret_cast<SendClaim>(base + kSendClaimRva);
-    task_is_completed = reinterpret_cast<TaskBool>(base + 0xC6DB680);
-    task_is_faulted = reinterpret_cast<TaskBool>(base + 0xC6E1094);
+    struct stat il2cpp_stat{};
+    if (!info.dli_fname || stat(info.dli_fname, &il2cpp_stat) != 0
+            || il2cpp_stat.st_size != kExpectedIl2CppSize) {
+        LOGE("[NECTAR] unsupported libil2cpp.so; hooks were not installed");
+        return;
+    }
+    task_is_completed = reinterpret_cast<TaskBool>(base + kTaskIsCompletedRva);
+    task_is_faulted = reinterpret_cast<TaskBool>(base + kTaskIsFaultedRva);
 
     install_hook(base, kRegisterMapObjectRva, reinterpret_cast<void *>(hooked_register_map_object), original_register_map_object);
     install_hook(base, kMapObjectManagerUpdateRva, reinterpret_cast<void *>(hooked_map_update), original_map_update);
-    install_hook(base, kGetFlowerProtoRva, reinterpret_cast<void *>(hooked_get_flower_proto), original_get_flower_proto);
-    install_hook(base, kConstructProtoObjectRva, reinterpret_cast<void *>(hooked_construct_proto_object), original_construct_proto_object);
-    install_hook(base, kUpdateProtoObjectRva, reinterpret_cast<void *>(hooked_update_proto_object), original_update_proto_object);
     install_hook(base, kFlowerModelUpdatedRva, reinterpret_cast<void *>(hooked_flower_model_updated), original_flower_model_updated);
     install_hook(base, kRpcManagerConstructorRva, reinterpret_cast<void *>(hooked_rpc_manager_constructor), original_rpc_manager_constructor);
     install_hook(base, kRpcManagerLoggedInRva, reinterpret_cast<void *>(hooked_rpc_manager_logged_in), original_rpc_manager_logged_in);
@@ -587,7 +592,7 @@ void start(const char *game_data_dir) {
     install_hook(base, kPlantingStartRva, reinterpret_cast<void *>(hooked_planting_start), original_planting_start);
     install_hook(base, kPlantingStateUpdatedRva, reinterpret_cast<void *>(hooked_planting_state_updated), original_planting_state_updated);
     install_hook(base, kLocationControllerAwakeRva, reinterpret_cast<void *>(hooked_location_controller_awake), original_location_controller_awake);
-    LOGI("[NECTAR] v150 RPC hooks installed base=%" PRIxPTR " mode=%s", base, mode_path);
+    LOGI("[NECTAR] v151 RPC hooks installed base=%" PRIxPTR " mode=%s", base, mode_path);
 }
 
 }  // namespace
