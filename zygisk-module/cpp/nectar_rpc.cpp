@@ -123,6 +123,7 @@ char mode_path[512]{};
 char target_path[512]{};
 char status_path[512]{};
 char claim_log_path[512]{};
+char system_gps_path[512]{};
 std::map<std::string, FlowerRecord> flowers;
 std::map<std::string, std::string> last_flower_state;
 long long last_tick_ms{};
@@ -214,7 +215,15 @@ bool current_location(double &latitude, double &longitude) {
             return true;
         }
     }
-    return false;
+    // The Magisk service writes the currently active system location here.
+    // It is used only when the version-specific in-memory layout is unknown.
+    FILE *fallback = std::fopen(system_gps_path, "r");
+    if (!fallback) return false;
+    const int read = std::fscanf(fallback, "%lf\t%lf", &latitude, &longitude);
+    std::fclose(fallback);
+    return read == 2 && std::isfinite(latitude) && std::isfinite(longitude) &&
+           std::abs(latitude) > 0.0001 && std::abs(longitude) > 0.0001 &&
+           std::abs(latitude) <= 90.0 && std::abs(longitude) <= 180.0;
 }
 
 void load_test_target() {
@@ -579,6 +588,7 @@ void start(const char *game_data_dir) {
     std::snprintf(target_path, sizeof(target_path), "%s/files/nectar_rpc_target.tsv", game_data_dir);
     std::snprintf(status_path, sizeof(status_path), "%s/files/nectar_status.tsv", game_data_dir);
     std::snprintf(claim_log_path, sizeof(claim_log_path), "%s/files/nectar_claims.tsv", game_data_dir);
+    std::snprintf(system_gps_path, sizeof(system_gps_path), "%s/files/nectar_system_gps.tsv", game_data_dir);
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);

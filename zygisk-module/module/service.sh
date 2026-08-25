@@ -8,6 +8,7 @@ CONTROL_MODE="$MODDIR/nectar_control_mode.txt"
 PUBLIC_STATUS="$MODDIR/nectar_status.tsv"
 GAME_MODE="$GAME_FILES/nectar_rpc_mode.txt"
 GAME_STATUS="$GAME_FILES/nectar_status.tsv"
+GAME_GPS="$GAME_FILES/nectar_system_gps.tsv"
 
 [ -f "$CONTROL_MODE" ] || printf 'diag\n' >"$CONTROL_MODE"
 chmod 0644 "$CONTROL_MODE"
@@ -25,6 +26,13 @@ chmod 0644 "$CONTROL_MODE"
     if [ -r "$GAME_STATUS" ]; then
       cp "$GAME_STATUS" "$PUBLIC_STATUS" 2>/dev/null
       chmod 0644 "$PUBLIC_STATUS" 2>/dev/null
+    fi
+    # Supply the active system location as a read-only fallback for game
+    # versions whose internal LocationController layout has changed.
+    SYSTEM_GPS="$(dumpsys location 2>/dev/null | sed -n 's|.*Location\[gps \([0-9.-]*\),\([0-9.-]*\).*|\1\t\2|p' | head -n 1)"
+    if [ -n "$SYSTEM_GPS" ]; then
+      printf '%s\n' "$SYSTEM_GPS" >"$GAME_GPS"
+      chmod 0644 "$GAME_GPS" 2>/dev/null
     fi
     sleep 2
   done
