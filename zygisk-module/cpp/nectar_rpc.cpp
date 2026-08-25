@@ -81,6 +81,9 @@ using CompletePikminTask = void *(*)(void *, void *, bool, void *);
 using PreparePikminTasks = void *(*)(void *, void *, void *);
 using ShouldPrepareCompletion = bool (*)(void *, void *, void *);
 using GetInventoryItemId = void *(*)(void *, void *);
+using GetPikminTaskList = void *(*)(void *, void *);
+using GetPikminTaskProto = void *(*)(void *, void *);
+using GetTaskFinishTimeMs = int64_t (*)(void *, void *);
 
 struct Il2CppStringLayout {
     void *klass;
@@ -128,6 +131,9 @@ CompletePikminTask original_complete_pikmin_task{};
 PreparePikminTasks original_prepare_pikmin_tasks{};
 ShouldPrepareCompletion original_should_prepare_completion{};
 GetInventoryItemId get_inventory_item_id{};
+GetPikminTaskList original_get_pikmin_task_list{};
+GetPikminTaskProto get_pikmin_task_proto{};
+GetTaskFinishTimeMs get_task_finish_time_ms{};
 TaskBool task_is_completed{};
 TaskBool task_is_faulted{};
 void *request_class{};
@@ -147,6 +153,7 @@ std::map<std::string, std::string> last_flower_state;
 long long last_tick_ms{};
 long long last_claim_ms{};
 long long last_status_ms{};
+long long last_task_list_trace_ms{};
 bool test_once_sent{};
 bool target_loaded{};
 void *pending_task{};
@@ -211,6 +218,39 @@ bool hooked_should_prepare_completion(void *self, void *task, void *method_info)
     return ready;
 }
 
+// The expedition page reads its cards from this inventory list.  Keep this
+// diagnostic read-only until both its current layout and the game's readiness
+// predicate have been observed on-device.
+void *hooked_get_pikmin_task_list(void *self, void *method_info) {
+    void *result = original_get_pikmin_task_list
+            ? original_get_pikmin_task_list(self, method_info) : nullptr;
+    const long long now = now_ms();
+    if (!result || !get_inventory_item_id || !get_pikmin_task_proto || !get_task_finish_time_ms ||
+        now - last_task_list_trace_ms < 5000) return result;
+    last_task_list_trace_ms = now;
+
+    // System.Collections.Generic.List<T>: _items at +0x10, _size at +0x18;
+    // managed arrays store their first element at +0x20 on arm64 IL2CPP.
+    auto *bytes = static_cast<uint8_t *>(result);
+    void *items = *reinterpret_cast<void **>(bytes + 0x10);
+    const int count = *reinterpret_cast<int *>(bytes + 0x18);
+    if (!items || count < 0 || count > 128) {
+        LOGE("[RETURN-DIAG] task-list invalid self=%p list=%p count=%d", self, result, count);
+        return result;
+    }
+    LOGI("[RETURN-DIAG] task-list self=%p count=%d", self, count);
+    for (int index = 0; index < count; ++index) {
+        void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
+        if (!task) continue;
+        void *id = get_inventory_item_id(task, nullptr);
+        void *proto = get_pikmin_task_proto(task, nullptr);
+        const int64_t finish_ms = proto ? get_task_finish_time_ms(proto, nullptr) : 0;
+        LOGI("[RETURN-DIAG] task-list-item id=%s finishMs=%" PRId64 " due=%d",
+             utf8_string(id).c_str(), finish_ms, finish_ms > 0 && finish_ms <= now ? 1 : 0);
+    }
+    return result;
+}
+
 void *find_class(const char *namespc, const char *name) {
     if (!domain_get || !domain_get_assemblies || !assembly_get_image || !class_from_name) return nullptr;
     size_t count{};
@@ -273,6 +313,24 @@ void install_return_diagnostic_hook() {
     A64HookFunction(ready_entry, reinterpret_cast<void *>(hooked_should_prepare_completion),
                     reinterpret_cast<void **>(&original_should_prepare_completion));
     LOGI("[RETURN-DIAG] readiness hook installed method=%p entry=%p", ready_method, ready_entry);
+
+    void *inventory = find_class("Niantic.Ichigo.Inventory", "InventoryManager");
+    void *list_method = inventory ? class_get_method_from_name(inventory, "GetPikminTaskList", 0) : nullptr;
+    void *list_entry = list_method ? *reinterpret_cast<void **>(list_method) : nullptr;
+    void *proto_method = task_class ? class_get_method_from_name(task_class, "get_Proto", 0) : nullptr;
+    void *proto_entry = proto_method ? *reinterpret_cast<void **>(proto_method) : nullptr;
+    void *proto_class = find_class("Ichigo.Proto", "PikminTaskProto");
+    void *finish_method = proto_class ? class_get_method_from_name(proto_class, "get_FinishTimeMs", 0) : nullptr;
+    void *finish_entry = finish_method ? *reinterpret_cast<void **>(finish_method) : nullptr;
+    if (!list_entry || !proto_entry || !finish_entry) {
+        LOGE("[RETURN-DIAG] task-list or task-time method not found");
+        return;
+    }
+    get_pikmin_task_proto = reinterpret_cast<GetPikminTaskProto>(proto_entry);
+    get_task_finish_time_ms = reinterpret_cast<GetTaskFinishTimeMs>(finish_entry);
+    A64HookFunction(list_entry, reinterpret_cast<void *>(hooked_get_pikmin_task_list),
+                    reinterpret_cast<void **>(&original_get_pikmin_task_list));
+    LOGI("[RETURN-DIAG] task-list hook installed method=%p entry=%p", list_method, list_entry);
 }
 
 long long now_ms() {
