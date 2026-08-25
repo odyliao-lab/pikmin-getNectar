@@ -29,6 +29,17 @@ Copy-Item -LiteralPath (Join-Path $build 'libpikmin_nectar_rpc.so') `
 
 $zip = Join-Path $root 'pikmin-nectar-rpc-v151.zip'
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-& tar.exe -a -c -f $zip -C $module module.prop service.sh zygisk
-if ($LASTEXITCODE -ne 0) { throw 'Module packaging failed.' }
+# Magisk/Kitsune requires POSIX-style entry names (zygisk/arm64-v8a.so).
+# Windows tar.exe uses an archive dialect its installer rejects, while
+# Compress-Archive writes Windows backslashes.  The JDK jar tool produces a
+# conventional deflated ZIP with portable forward-slash entry names.
+$jar = (Get-Command jar -ErrorAction Stop).Source
+Push-Location $module
+try {
+    & $jar --create --file $zip META-INF module.prop service.sh zygisk
+    if ($LASTEXITCODE -ne 0) { throw 'Module packaging failed.' }
+}
+finally {
+    Pop-Location
+}
 Get-Item -LiteralPath $zip | Select-Object FullName, Length

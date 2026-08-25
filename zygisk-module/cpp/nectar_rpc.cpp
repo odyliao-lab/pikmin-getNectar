@@ -78,6 +78,7 @@ using RequestSetString = void (*)(void *, void *, void *);
 using RequestSetBool = void (*)(void *, bool, void *);
 using SendClaim = void *(*)(void *, void *, void *, int, void *);
 using CompletePikminTask = void *(*)(void *, void *, bool, void *);
+using PreparePikminTasks = void *(*)(void *, void *, void *);
 
 struct Il2CppStringLayout {
     void *klass;
@@ -122,6 +123,7 @@ RequestSetString request_set_map_object_id{};
 RequestSetBool request_set_include_failure{};
 SendClaim send_claim{};
 CompletePikminTask original_complete_pikmin_task{};
+PreparePikminTasks original_prepare_pikmin_tasks{};
 TaskBool task_is_completed{};
 TaskBool task_is_faulted{};
 void *request_class{};
@@ -183,6 +185,16 @@ void *hooked_complete_pikmin_task(void *self, void *task_id, bool discard_postca
             ? original_complete_pikmin_task(self, task_id, discard_postcard, method_info) : nullptr;
 }
 
+// The preparer receives the game's own collection of returned task ids before
+// a reward is claimed.  This trace is deliberately passive: it establishes a
+// version-safe source for background work without reading guessed HashSet
+// layouts or emitting any RPCs.
+void *hooked_prepare_pikmin_tasks(void *self, void *task_ids, void *method_info) {
+    LOGI("[RETURN-DIAG] prepare-pending self=%p taskIds=%p", self, task_ids);
+    return original_prepare_pikmin_tasks
+            ? original_prepare_pikmin_tasks(self, task_ids, method_info) : nullptr;
+}
+
 void *find_class(const char *namespc, const char *name) {
     if (!domain_get || !domain_get_assemblies || !assembly_get_image || !class_from_name) return nullptr;
     size_t count{};
@@ -218,6 +230,18 @@ void install_return_diagnostic_hook() {
     A64HookFunction(entry, reinterpret_cast<void *>(hooked_complete_pikmin_task),
                     reinterpret_cast<void **>(&original_complete_pikmin_task));
     LOGI("[RETURN-DIAG] hook installed method=%p entry=%p", method, entry);
+
+    void *preparer = find_class("Niantic.Ichigo.Game.PikminTasks", "PikminTaskCompletionPreparer");
+    void *prepare_method = preparer
+            ? class_get_method_from_name(preparer, "PrepareCompletionAsync", 1) : nullptr;
+    void *prepare_entry = prepare_method ? *reinterpret_cast<void **>(prepare_method) : nullptr;
+    if (!prepare_entry) {
+        LOGE("[RETURN-DIAG] PrepareCompletionAsync(taskIds) not found");
+        return;
+    }
+    A64HookFunction(prepare_entry, reinterpret_cast<void *>(hooked_prepare_pikmin_tasks),
+                    reinterpret_cast<void **>(&original_prepare_pikmin_tasks));
+    LOGI("[RETURN-DIAG] preparer hook installed method=%p entry=%p", prepare_method, prepare_entry);
 }
 
 long long now_ms() {
