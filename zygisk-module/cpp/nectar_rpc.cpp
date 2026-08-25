@@ -498,6 +498,10 @@ void hooked_update_proto_object(void *self, void *proto, void *method_info) {
 void hooked_flower_model_updated(void *self, void *method_info) {
     if (original_flower_model_updated) original_flower_model_updated(self, method_info);
     log_flower(self);
+    // v151 registers live flowers without consistently calling the manager's
+    // Update method.  Run the same mode-gated heartbeat here so diagnostic
+    // status and opt-in automation both see those observations.
+    maybe_claim();
 }
 void hooked_rpc_manager_constructor(void *self, void *method_info) {
     if (original_rpc_manager_constructor) original_rpc_manager_constructor(self, method_info);
@@ -513,6 +517,7 @@ void hooked_rpc_manager_logged_in(void *self, void *server_url, void *player_id,
 void hooked_register_map_object(void *self, void *map_object, int tag, void *method_info) {
     if (original_register_map_object) original_register_map_object(self, map_object, tag, method_info);
     log_flower(map_object);
+    maybe_claim();
 }
 void hooked_map_update(void *self, void *method_info) {
     if (original_map_update) original_map_update(self, method_info);
