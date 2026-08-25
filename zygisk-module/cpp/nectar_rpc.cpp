@@ -84,6 +84,8 @@ using GetInventoryItemId = void *(*)(void *, void *);
 using GetPikminTaskList = void *(*)(void *, void *);
 using GetPikminTaskProto = void *(*)(void *, void *);
 using GetTaskFinishTimeMs = int64_t (*)(void *, void *);
+using PikminTaskPreparerConstructor = void (*)(void *, void *, void *, void *, void *);
+using PikminTaskActionManagerConstructor = void (*)(void *, void *);
 
 struct Il2CppStringLayout {
     void *klass;
@@ -134,6 +136,8 @@ GetInventoryItemId get_inventory_item_id{};
 GetPikminTaskList original_get_pikmin_task_list{};
 GetPikminTaskProto get_pikmin_task_proto{};
 GetTaskFinishTimeMs get_task_finish_time_ms{};
+PikminTaskPreparerConstructor original_pikmin_task_preparer_constructor{};
+PikminTaskActionManagerConstructor original_pikmin_task_action_manager_constructor{};
 TaskBool task_is_completed{};
 TaskBool task_is_faulted{};
 void *request_class{};
@@ -141,6 +145,9 @@ void *rpc_manager{};
 void *planting_controller{};
 void *interaction_settings{};
 void *location_controller{};
+void *return_preparer{};
+void *return_inventory_manager{};
+void *return_action_manager{};
 char flower_log_path[512]{};
 char mode_path[512]{};
 char target_path[512]{};
@@ -148,14 +155,17 @@ char status_path[512]{};
 char claim_log_path[512]{};
 char system_gps_path[512]{};
 char return_trace_path[512]{};
+char return_mode_path[512]{};
 std::map<std::string, FlowerRecord> flowers;
 std::map<std::string, std::string> last_flower_state;
 long long last_tick_ms{};
 long long last_claim_ms{};
 long long last_status_ms{};
 long long last_task_list_trace_ms{};
+long long last_return_dry_run_ms{};
 bool test_once_sent{};
 bool target_loaded{};
+bool return_one_dispatched{};
 void *pending_task{};
 uint32_t pending_task_handle{};
 std::string pending_id;
@@ -251,6 +261,63 @@ void *hooked_get_pikmin_task_list(void *self, void *method_info) {
     return result;
 }
 
+// This constructor is a one-time Zenject injection point, not a UI rendering
+// path.  It provides the exact live manager instances used by the game.
+void hooked_pikmin_task_preparer_constructor(void *self, void *inventory, void *rpc,
+                                             void *server_clock, void *method_info) {
+    if (original_pikmin_task_preparer_constructor) {
+        original_pikmin_task_preparer_constructor(self, inventory, rpc, server_clock, method_info);
+    }
+    return_preparer = self;
+    return_inventory_manager = inventory;
+    LOGI("[RETURN-DIAG] preparer captured self=%p inventory=%p rpc=%p clock=%p",
+         self, inventory, rpc, server_clock);
+}
+
+// Capture the game's own action manager. No return RPC is invoked here.
+void hooked_pikmin_task_action_manager_constructor(void *self, void *method_info) {
+    if (original_pikmin_task_action_manager_constructor) {
+        original_pikmin_task_action_manager_constructor(self, method_info);
+    }
+    return_action_manager = self;
+    LOGI("[RETURN-DIAG] action manager captured self=%p", self);
+}
+
+// Runs on the game's main update thread.  It asks the game's own readiness
+// predicate about each live inventory task and only writes diagnostics.
+void dry_run_return_tasks() {
+    const long long now = now_ms();
+    if (!return_preparer || !return_inventory_manager || !original_get_pikmin_task_list ||
+        !original_should_prepare_completion || !get_inventory_item_id ||
+        now - last_return_dry_run_ms < 5000) return;
+    last_return_dry_run_ms = now;
+    void *list = original_get_pikmin_task_list(return_inventory_manager, nullptr);
+    if (!list) return;
+    void *items = *reinterpret_cast<void **>(static_cast<uint8_t *>(list) + 0x10);
+    const int count = *reinterpret_cast<int *>(static_cast<uint8_t *>(list) + 0x18);
+    if (!items || count < 0 || count > 128) return;
+    int ready_count{};
+    int due_count{};
+    for (int index = 0; index < count; ++index) {
+        void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
+        if (!task) continue;
+        void *task_id = get_inventory_item_id(task, nullptr);
+        if (original_should_prepare_completion(return_preparer, task, nullptr)) {
+            ++ready_count;
+            append_return_trace("dry-run-ready", return_preparer, task_id);
+        }
+        void *proto = get_pikmin_task_proto ? get_pikmin_task_proto(task, nullptr) : nullptr;
+        const int64_t finish_ms = proto && get_task_finish_time_ms
+                ? get_task_finish_time_ms(proto, nullptr) : 0;
+        if (finish_ms > 0 && finish_ms <= now) {
+            ++due_count;
+            append_return_trace("dry-run-finish-due", return_preparer, task_id);
+        }
+    }
+    LOGI("[RETURN-DIAG] dry-run tasks=%d preparerReady=%d finishDue=%d",
+         count, ready_count, due_count);
+}
+
 void *find_class(const char *namespc, const char *name) {
     if (!domain_get || !domain_get_assemblies || !assembly_get_image || !class_from_name) return nullptr;
     size_t count{};
@@ -272,6 +339,16 @@ void install_return_diagnostic_hook() {
         LOGE("[RETURN-DIAG] PikminTaskActionManager class not found");
         return;
     }
+    void *action_ctor = class_get_method_from_name(klass, ".ctor", 0);
+    void *action_ctor_entry = action_ctor ? *reinterpret_cast<void **>(action_ctor) : nullptr;
+    if (!action_ctor_entry) {
+        LOGE("[RETURN-DIAG] PikminTaskActionManager constructor not found");
+        return;
+    }
+    A64HookFunction(action_ctor_entry, reinterpret_cast<void *>(hooked_pikmin_task_action_manager_constructor),
+                    reinterpret_cast<void **>(&original_pikmin_task_action_manager_constructor));
+    LOGI("[RETURN-DIAG] action-manager constructor hook installed method=%p entry=%p",
+         action_ctor, action_ctor_entry);
     // This is the public overload that contains both the task id and postcard policy.
     void *method = class_get_method_from_name(klass, "CompletePikminTaskAsync", 2);
     if (!method) {
@@ -288,6 +365,16 @@ void install_return_diagnostic_hook() {
     LOGI("[RETURN-DIAG] hook installed method=%p entry=%p", method, entry);
 
     void *preparer = find_class("Niantic.Ichigo.Game.PikminTasks", "PikminTaskCompletionPreparer");
+    void *preparer_ctor = preparer ? class_get_method_from_name(preparer, ".ctor", 3) : nullptr;
+    void *preparer_ctor_entry = preparer_ctor ? *reinterpret_cast<void **>(preparer_ctor) : nullptr;
+    if (!preparer_ctor_entry) {
+        LOGE("[RETURN-DIAG] PikminTaskCompletionPreparer constructor not found");
+        return;
+    }
+    A64HookFunction(preparer_ctor_entry, reinterpret_cast<void *>(hooked_pikmin_task_preparer_constructor),
+                    reinterpret_cast<void **>(&original_pikmin_task_preparer_constructor));
+    LOGI("[RETURN-DIAG] preparer constructor hook installed method=%p entry=%p",
+         preparer_ctor, preparer_ctor_entry);
     void *prepare_method = preparer
             ? class_get_method_from_name(preparer, "PrepareCompletionAsync", 1) : nullptr;
     void *prepare_entry = prepare_method ? *reinterpret_cast<void **>(prepare_method) : nullptr;
@@ -726,9 +813,52 @@ void hooked_register_map_object(void *self, void *map_object, int tag, void *met
     log_flower(map_object);
     maybe_claim();
 }
+
+std::string read_return_mode() {
+    FILE *file = std::fopen(return_mode_path, "r");
+    if (!file) return "dry-run";
+    char value[32]{};
+    std::fgets(value, sizeof(value), file);
+    std::fclose(file);
+    std::string result(value);
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r' || result.back() == ' ')) result.pop_back();
+    return result.empty() ? "dry-run" : result;
+}
+
+// One-shot native validation.  This is intentionally separate from dry-run:
+// it can dispatch at most one server-backed completion in a process lifetime.
+void maybe_dispatch_one_return_task() {
+    if (return_one_dispatched || read_return_mode() != "one" || !return_action_manager ||
+        !return_inventory_manager || !original_get_pikmin_task_list || !original_complete_pikmin_task ||
+        !get_inventory_item_id || !get_pikmin_task_proto || !get_task_finish_time_ms) return;
+    void *list = original_get_pikmin_task_list(return_inventory_manager, nullptr);
+    if (!list) return;
+    void *items = *reinterpret_cast<void **>(static_cast<uint8_t *>(list) + 0x10);
+    const int count = *reinterpret_cast<int *>(static_cast<uint8_t *>(list) + 0x18);
+    if (!items || count < 0 || count > 128) return;
+    const long long now = now_ms();
+    for (int index = 0; index < count; ++index) {
+        void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
+        if (!task) continue;
+        void *proto = get_pikmin_task_proto(task, nullptr);
+        const int64_t finish_ms = proto ? get_task_finish_time_ms(proto, nullptr) : 0;
+        if (finish_ms <= 0 || finish_ms > now) continue;
+        void *task_id = get_inventory_item_id(task, nullptr);
+        if (!task_id) continue;
+        return_one_dispatched = true;
+        append_return_trace("native-dispatch-one", return_action_manager, task_id);
+        void *async_task = original_complete_pikmin_task(return_action_manager, task_id, false, nullptr);
+        if (async_task && gchandle_new) gchandle_new(async_task, false);
+        LOGI("[RETURN-DIAG] native one-shot dispatched task=%s async=%p",
+             utf8_string(task_id).c_str(), async_task);
+        return;
+    }
+}
 void hooked_map_update(void *self, void *method_info) {
     if (original_map_update) original_map_update(self, method_info);
     maybe_claim();
+    dry_run_return_tasks();
+    maybe_dispatch_one_return_task();
 }
 void hooked_planting_init(void *self, void *method_info) {
     if (original_planting_init) original_planting_init(self, method_info);
@@ -786,6 +916,7 @@ void start(const char *game_data_dir) {
     std::snprintf(claim_log_path, sizeof(claim_log_path), "%s/files/nectar_claims.tsv", game_data_dir);
     std::snprintf(system_gps_path, sizeof(system_gps_path), "%s/files/nectar_system_gps.tsv", game_data_dir);
     std::snprintf(return_trace_path, sizeof(return_trace_path), "%s/files/return_rpc_trace.tsv", game_data_dir);
+    std::snprintf(return_mode_path, sizeof(return_mode_path), "%s/files/return_rpc_mode.txt", game_data_dir);
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);
