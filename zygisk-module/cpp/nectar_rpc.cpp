@@ -79,6 +79,8 @@ using RequestSetBool = void (*)(void *, bool, void *);
 using SendClaim = void *(*)(void *, void *, void *, int, void *);
 using CompletePikminTask = void *(*)(void *, void *, bool, void *);
 using PreparePikminTasks = void *(*)(void *, void *, void *);
+using ShouldPrepareCompletion = bool (*)(void *, void *, void *);
+using GetInventoryItemId = void *(*)(void *, void *);
 
 struct Il2CppStringLayout {
     void *klass;
@@ -124,6 +126,8 @@ RequestSetBool request_set_include_failure{};
 SendClaim send_claim{};
 CompletePikminTask original_complete_pikmin_task{};
 PreparePikminTasks original_prepare_pikmin_tasks{};
+ShouldPrepareCompletion original_should_prepare_completion{};
+GetInventoryItemId get_inventory_item_id{};
 TaskBool task_is_completed{};
 TaskBool task_is_faulted{};
 void *request_class{};
@@ -195,6 +199,18 @@ void *hooked_prepare_pikmin_tasks(void *self, void *task_ids, void *method_info)
             ? original_prepare_pikmin_tasks(self, task_ids, method_info) : nullptr;
 }
 
+// This method is the game's own readiness gate.  It lets us capture only task
+// ids that the client itself considers completable, rather than probing every
+// expedition or inferring state from UI objects.
+bool hooked_should_prepare_completion(void *self, void *task, void *method_info) {
+    const bool ready = original_should_prepare_completion
+            && original_should_prepare_completion(self, task, method_info);
+    if (!ready || !task || !get_inventory_item_id) return ready;
+    void *task_id = get_inventory_item_id(task, nullptr);
+    append_return_trace("ready-task", self, task_id);
+    return ready;
+}
+
 void *find_class(const char *namespc, const char *name) {
     if (!domain_get || !domain_get_assemblies || !assembly_get_image || !class_from_name) return nullptr;
     size_t count{};
@@ -242,6 +258,21 @@ void install_return_diagnostic_hook() {
     A64HookFunction(prepare_entry, reinterpret_cast<void *>(hooked_prepare_pikmin_tasks),
                     reinterpret_cast<void **>(&original_prepare_pikmin_tasks));
     LOGI("[RETURN-DIAG] preparer hook installed method=%p entry=%p", prepare_method, prepare_entry);
+
+    void *ready_method = class_get_method_from_name(preparer, "ShouldPrepareCompletion", 1);
+    void *ready_entry = ready_method ? *reinterpret_cast<void **>(ready_method) : nullptr;
+    void *task_class = find_class("Niantic.Ichigo.Inventory", "PikminTaskInventoryItem");
+    void *id_method = task_class
+            ? class_get_method_from_name(task_class, "get_Id", 0) : nullptr;
+    void *id_entry = id_method ? *reinterpret_cast<void **>(id_method) : nullptr;
+    if (!ready_entry || !id_entry) {
+        LOGE("[RETURN-DIAG] readiness or task-id method not found");
+        return;
+    }
+    get_inventory_item_id = reinterpret_cast<GetInventoryItemId>(id_entry);
+    A64HookFunction(ready_entry, reinterpret_cast<void *>(hooked_should_prepare_completion),
+                    reinterpret_cast<void **>(&original_should_prepare_completion));
+    LOGI("[RETURN-DIAG] readiness hook installed method=%p entry=%p", ready_method, ready_entry);
 }
 
 long long now_ms() {
