@@ -166,6 +166,11 @@ long long last_return_dry_run_ms{};
 bool test_once_sent{};
 bool target_loaded{};
 bool return_one_dispatched{};
+bool return_batch_waiting{};
+bool return_batch_stopped{};
+int return_batch_baseline_count{};
+int return_batch_completed{};
+long long return_batch_dispatched_ms{};
 void *pending_task{};
 uint32_t pending_task_handle{};
 std::string pending_id;
@@ -854,11 +859,57 @@ void maybe_dispatch_one_return_task() {
         return;
     }
 }
+
+void maybe_dispatch_return_batch() {
+    if (read_return_mode() != "batch" || return_batch_stopped || !return_action_manager ||
+        !return_inventory_manager || !original_get_pikmin_task_list || !original_complete_pikmin_task ||
+        !get_inventory_item_id || !get_pikmin_task_proto || !get_task_finish_time_ms) return;
+    void *list = original_get_pikmin_task_list(return_inventory_manager, nullptr);
+    if (!list) return;
+    void *items = *reinterpret_cast<void **>(static_cast<uint8_t *>(list) + 0x10);
+    const int count = *reinterpret_cast<int *>(static_cast<uint8_t *>(list) + 0x18);
+    if (!items || count < 0 || count > 128) return;
+    const long long now = now_ms();
+    if (return_batch_waiting) {
+        if (count < return_batch_baseline_count) {
+            return_batch_waiting = false;
+            ++return_batch_completed;
+            LOGI("[RETURN-DIAG] batch confirmed completed=%d", return_batch_completed);
+        } else if (now - return_batch_dispatched_ms > 20000) {
+            return_batch_stopped = true;
+            LOGE("[RETURN-DIAG] batch stopped: inventory did not update within 20s");
+        }
+        return;
+    }
+    if (return_batch_completed >= 5) {
+        return_batch_stopped = true;
+        LOGI("[RETURN-DIAG] batch paused after five confirmed completions");
+        return;
+    }
+    for (int index = 0; index < count; ++index) {
+        void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
+        if (!task) continue;
+        void *proto = get_pikmin_task_proto(task, nullptr);
+        const int64_t finish_ms = proto ? get_task_finish_time_ms(proto, nullptr) : 0;
+        if (finish_ms <= 0 || finish_ms > now) continue;
+        void *task_id = get_inventory_item_id(task, nullptr);
+        if (!task_id) continue;
+        return_batch_baseline_count = count;
+        return_batch_dispatched_ms = now;
+        return_batch_waiting = true;
+        append_return_trace("native-dispatch-batch", return_action_manager, task_id);
+        void *async_task = original_complete_pikmin_task(return_action_manager, task_id, false, nullptr);
+        if (async_task && gchandle_new) gchandle_new(async_task, false);
+        LOGI("[RETURN-DIAG] batch dispatched task=%s async=%p", utf8_string(task_id).c_str(), async_task);
+        return;
+    }
+}
 void hooked_map_update(void *self, void *method_info) {
     if (original_map_update) original_map_update(self, method_info);
     maybe_claim();
     dry_run_return_tasks();
     maybe_dispatch_one_return_task();
+    maybe_dispatch_return_batch();
 }
 void hooked_planting_init(void *self, void *method_info) {
     if (original_planting_init) original_planting_init(self, method_info);
