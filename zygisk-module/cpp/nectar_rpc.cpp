@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cerrno>
 #include <dlfcn.h>
 #include <ifaddrs.h>
 #include <map>
@@ -355,7 +356,10 @@ void write_status(const std::string &mode, bool online, bool planting) {
     double latitude{}, longitude{};
     const bool has_location = current_location(latitude, longitude);
     FILE *file = std::fopen(status_path, "w");
-    if (!file) return;
+    if (!file) {
+        LOGE("[NECTAR] unable to write status path=%s errno=%d", status_path, errno);
+        return;
+    }
     std::fprintf(file, "%lld\t%s\t%d\t%d\t%d\t%.7f\t%.7f\t%zu\t%d\t%s\n",
                  now_ms(), mode.c_str(), planting ? 1 : 0, online ? 1 : 0,
                  has_location ? 1 : 0, latitude, longitude, flowers.size(),
