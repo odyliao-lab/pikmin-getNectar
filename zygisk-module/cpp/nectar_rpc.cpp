@@ -156,6 +156,7 @@ char claim_log_path[512]{};
 char system_gps_path[512]{};
 char return_trace_path[512]{};
 char return_mode_path[512]{};
+char return_postcard_policy_path[512]{};
 std::map<std::string, FlowerRecord> flowers;
 std::map<std::string, std::string> last_flower_state;
 long long last_tick_ms{};
@@ -830,6 +831,17 @@ std::string read_return_mode() {
     return result.empty() ? "dry-run" : result;
 }
 
+// The policy defaults to preserving postcards. Only the explicit "discard"
+// value changes the boolean passed to the game's native completion API.
+bool return_discard_postcard() {
+    FILE *file = std::fopen(return_postcard_policy_path, "r");
+    if (!file) return false;
+    char value[32]{};
+    std::fgets(value, sizeof(value), file);
+    std::fclose(file);
+    return std::strncmp(value, "discard", 7) == 0;
+}
+
 // One-shot native validation.  This is intentionally separate from dry-run:
 // it can dispatch at most one server-backed completion in a process lifetime.
 void maybe_dispatch_one_return_task() {
@@ -852,7 +864,8 @@ void maybe_dispatch_one_return_task() {
         if (!task_id) continue;
         return_one_dispatched = true;
         append_return_trace("native-dispatch-one", return_action_manager, task_id);
-        void *async_task = original_complete_pikmin_task(return_action_manager, task_id, false, nullptr);
+        const bool discard_postcard = return_discard_postcard();
+        void *async_task = original_complete_pikmin_task(return_action_manager, task_id, discard_postcard, nullptr);
         if (async_task && gchandle_new) gchandle_new(async_task, false);
         LOGI("[RETURN-DIAG] native one-shot dispatched task=%s async=%p",
              utf8_string(task_id).c_str(), async_task);
@@ -898,7 +911,8 @@ void maybe_dispatch_return_batch() {
         return_batch_dispatched_ms = now;
         return_batch_waiting = true;
         append_return_trace("native-dispatch-batch", return_action_manager, task_id);
-        void *async_task = original_complete_pikmin_task(return_action_manager, task_id, false, nullptr);
+        const bool discard_postcard = return_discard_postcard();
+        void *async_task = original_complete_pikmin_task(return_action_manager, task_id, discard_postcard, nullptr);
         if (async_task && gchandle_new) gchandle_new(async_task, false);
         LOGI("[RETURN-DIAG] batch dispatched task=%s async=%p", utf8_string(task_id).c_str(), async_task);
         return;
@@ -968,6 +982,7 @@ void start(const char *game_data_dir) {
     std::snprintf(system_gps_path, sizeof(system_gps_path), "%s/files/nectar_system_gps.tsv", game_data_dir);
     std::snprintf(return_trace_path, sizeof(return_trace_path), "%s/files/return_rpc_trace.tsv", game_data_dir);
     std::snprintf(return_mode_path, sizeof(return_mode_path), "%s/files/return_rpc_mode.txt", game_data_dir);
+    std::snprintf(return_postcard_policy_path, sizeof(return_postcard_policy_path), "%s/files/return_postcard_policy.txt", game_data_dir);
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);
