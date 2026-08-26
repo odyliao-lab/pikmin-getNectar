@@ -190,6 +190,8 @@ long long last_return_dry_run_ms{};
 bool test_once_sent{};
 bool target_loaded{};
 bool return_one_dispatched{};
+bool return_one_waiting{};
+int return_one_baseline_count{};
 bool return_batch_waiting{};
 bool return_batch_stopped{};
 int return_batch_baseline_count{};
@@ -1089,7 +1091,7 @@ int return_batch_limit() {
 // One-shot native validation.  This is intentionally separate from dry-run:
 // it can dispatch at most one server-backed completion in a process lifetime.
 void maybe_dispatch_one_return_task() {
-    if (return_one_dispatched || read_return_mode() != "one" || !return_action_manager ||
+    if (read_return_mode() != "one" || !return_action_manager ||
         !return_inventory_manager || !original_get_pikmin_task_list || !original_complete_pikmin_task ||
         !get_inventory_item_id || !get_pikmin_task_proto || !get_task_finish_time_ms) return;
     void *list = original_get_pikmin_task_list(return_inventory_manager, nullptr);
@@ -1097,6 +1099,16 @@ void maybe_dispatch_one_return_task() {
     void *items = *reinterpret_cast<void **>(static_cast<uint8_t *>(list) + 0x10);
     const int count = *reinterpret_cast<int *>(static_cast<uint8_t *>(list) + 0x18);
     if (!items || count < 0 || count > 128) return;
+    if (return_one_waiting) {
+        if (count < return_one_baseline_count) {
+            return_one_waiting = false;
+            write_return_status("one-confirmed", count, 1, false, return_discard_postcard());
+            return_batch_pending_id.clear();
+            return_batch_pending_reward.clear();
+        }
+        return;
+    }
+    if (return_one_dispatched) return;
     const long long now = now_ms();
     for (int index = 0; index < count; ++index) {
         void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
@@ -1107,8 +1119,14 @@ void maybe_dispatch_one_return_task() {
         void *task_id = get_inventory_item_id(task, nullptr);
         if (!task_id) continue;
         return_one_dispatched = true;
+        return_one_waiting = true;
+        return_one_baseline_count = count;
+        last_return_batch_mode = "one";
+        return_batch_pending_id = utf8_string(task_id);
+        return_batch_pending_reward = describe_return_reward(task);
         append_return_trace("native-dispatch-one", return_action_manager, task_id);
         const bool discard_postcard = return_discard_postcard();
+        write_return_status("one-dispatched", count, 0, true, discard_postcard);
         void *async_task = original_complete_pikmin_task(return_action_manager, task_id, discard_postcard, nullptr);
         if (async_task && gchandle_new) gchandle_new(async_task, false);
         LOGI("[RETURN-DIAG] native one-shot dispatched task=%s async=%p",
