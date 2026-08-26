@@ -20,6 +20,10 @@ GAME_STATUS="$GAME_FILES/nectar_status.tsv"
 GAME_GPS="$GAME_FILES/nectar_system_gps.tsv"
 GAME_RETURN_TRACE="$GAME_FILES/return_rpc_trace.tsv"
 PUBLIC_RETURN_TRACE="$MODDIR/return_rpc_trace.tsv"
+GAME_RETURN_HISTORY="$GAME_FILES/return_reward_history.tsv"
+PUBLIC_RETURN_HISTORY="$MODDIR/return_reward_history.tsv"
+GAME_CLAIMS="$GAME_FILES/nectar_claims.tsv"
+PUBLIC_CLAIMS="$MODDIR/nectar_claims.tsv"
 
 [ -f "$CONTROL_MODE" ] || printf 'diag\n' >"$CONTROL_MODE"
 [ -f "$RETURN_CONTROL_MODE" ] || printf 'dry-run\n' >"$RETURN_CONTROL_MODE"
@@ -73,6 +77,14 @@ chmod 0644 "$RETURN_BATCH_LIMIT"
     if [ -r "$GAME_RETURN_TRACE" ]; then
       cp "$GAME_RETURN_TRACE" "$PUBLIC_RETURN_TRACE" 2>/dev/null
       chmod 0644 "$PUBLIC_RETURN_TRACE" 2>/dev/null
+    fi
+    if [ -r "$GAME_RETURN_HISTORY" ]; then
+      cp "$GAME_RETURN_HISTORY" "$PUBLIC_RETURN_HISTORY" 2>/dev/null
+      chmod 0644 "$PUBLIC_RETURN_HISTORY" 2>/dev/null
+    fi
+    if [ -r "$GAME_CLAIMS" ]; then
+      cp "$GAME_CLAIMS" "$PUBLIC_CLAIMS" 2>/dev/null
+      chmod 0644 "$PUBLIC_CLAIMS" 2>/dev/null
     fi
     # Supply the active system location as a read-only fallback for game
     # versions whose internal LocationController layout has changed.

@@ -65,6 +65,9 @@ using DomainGetAssemblies = const void **(*)(void *, size_t *);
 using AssemblyGetImage = void *(*)(const void *);
 using ClassFromName = void *(*)(void *, const char *, const char *);
 using ClassGetMethodFromName = void *(*)(void *, const char *, int);
+using ClassGetMethods = void *(*)(void *, void **);
+using MethodGetName = const char *(*)(void *);
+using MethodGetParamCount = uint32_t (*)(void *);
 using ObjectNew = void *(*)(void *);
 using StringNew = void *(*)(const char *);
 using GcHandleNew = uint32_t (*)(void *, bool);
@@ -111,6 +114,9 @@ DomainGetAssemblies domain_get_assemblies{};
 AssemblyGetImage assembly_get_image{};
 ClassFromName class_from_name{};
 ClassGetMethodFromName class_get_method_from_name{};
+ClassGetMethods class_get_methods{};
+MethodGetName method_get_name{};
+MethodGetParamCount method_get_param_count{};
 ObjectNew object_new{};
 StringNew string_new{};
 GcHandleNew gchandle_new{};
@@ -156,6 +162,7 @@ char status_path[512]{};
 char claim_log_path[512]{};
 char system_gps_path[512]{};
 char return_trace_path[512]{};
+char return_history_path[512]{};
 char return_mode_path[512]{};
 char return_postcard_policy_path[512]{};
 char return_status_path[512]{};
@@ -177,6 +184,7 @@ int return_batch_baseline_count{};
 int return_batch_completed{};
 long long return_batch_dispatched_ms{};
 std::string last_return_batch_mode;
+std::string return_batch_pending_id;
 void *pending_task{};
 uint32_t pending_task_handle{};
 std::string pending_id;
@@ -211,6 +219,19 @@ void append_return_trace(const char *event, void *self, void *task_id) {
     chmod(return_trace_path, 0644);
 }
 
+// Append-only, controller-visible history. The status file below intentionally
+// holds only the latest state; this file is the audit record shown in the APK.
+void append_return_history(const char *event, int task_count, int completed,
+                           bool waiting, bool discard_postcard) {
+    FILE *file = std::fopen(return_history_path, "a");
+    if (!file) return;
+    std::fprintf(file, "%lld\t%s\t%s\t%d\t%d\t%d\t%s\t%s\n", now_ms(), event,
+                 return_batch_pending_id.c_str(), task_count, completed, waiting ? 1 : 0,
+                 discard_postcard ? "discard" : "keep", last_return_batch_mode.c_str());
+    std::fclose(file);
+    chmod(return_history_path, 0644);
+}
+
 // Compact, replace-in-place status for the controller.  Unlike a dispatch
 // trace, "batch-confirmed" is emitted only after the live inventory count
 // decreases, so the APK can distinguish a request from a completed claim.
@@ -221,6 +242,7 @@ void write_return_status(const char *event, int task_count, int completed, bool 
                  completed, waiting ? 1 : 0, discard_postcard ? "discard" : "keep");
     std::fclose(file);
     chmod(return_status_path, 0644);
+    append_return_history(event, task_count, completed, waiting, discard_postcard);
 }
 
 void write_compatibility_status(bool compatible, off_t observed_size) {
@@ -361,6 +383,26 @@ void *find_class(const char *namespc, const char *name) {
     return nullptr;
 }
 
+// Metadata-only probe.  It never invokes an unknown method or touches a task;
+// it simply records the public method names exposed by this exact game build so
+// reward fields can be decoded without relying on guessed object offsets.
+void log_task_proto_methods(void *proto_class) {
+    if (!proto_class || !class_get_methods || !method_get_name || !method_get_param_count) return;
+    void *iterator = nullptr;
+    int logged{};
+    while (void *method = class_get_methods(proto_class, &iterator)) {
+        const char *name = method_get_name(method);
+        if (!name) continue;
+        LOGI("[RETURN-META] PikminTaskProto method=%s params=%u", name,
+             method_get_param_count(method));
+        if (++logged >= 160) {
+            LOGE("[RETURN-META] method enumeration capped at 160 entries");
+            break;
+        }
+    }
+    LOGI("[RETURN-META] PikminTaskProto metadata methods=%d", logged);
+}
+
 void install_return_diagnostic_hook() {
     if (!class_get_method_from_name) {
         LOGE("[RETURN-DIAG] il2cpp_class_get_method_from_name unavailable");
@@ -439,6 +481,7 @@ void install_return_diagnostic_hook() {
     void *proto_method = task_class ? class_get_method_from_name(task_class, "get_Proto", 0) : nullptr;
     void *proto_entry = proto_method ? *reinterpret_cast<void **>(proto_method) : nullptr;
     void *proto_class = find_class("Ichigo.Proto", "PikminTaskProto");
+    log_task_proto_methods(proto_class);
     void *finish_method = proto_class ? class_get_method_from_name(proto_class, "get_FinishTimeMs", 0) : nullptr;
     void *finish_entry = finish_method ? *reinterpret_cast<void **>(finish_method) : nullptr;
     if (!list_entry || !proto_entry || !finish_entry) {
@@ -920,6 +963,7 @@ void maybe_dispatch_return_batch() {
             return_batch_stopped = false;
             return_batch_baseline_count = 0;
             return_batch_completed = 0;
+            return_batch_pending_id.clear();
         }
         last_return_batch_mode = mode;
         return;
@@ -929,6 +973,7 @@ void maybe_dispatch_return_batch() {
         return_batch_stopped = false;
         return_batch_baseline_count = 0;
         return_batch_completed = 0;
+        return_batch_pending_id.clear();
         last_return_batch_mode = mode;
     }
     if (return_batch_stopped || !return_action_manager ||
@@ -947,6 +992,7 @@ void maybe_dispatch_return_batch() {
             LOGI("[RETURN-DIAG] batch confirmed completed=%d", return_batch_completed);
             write_return_status("batch-confirmed", count, return_batch_completed, false,
                                 return_discard_postcard());
+            return_batch_pending_id.clear();
         } else if (now - return_batch_dispatched_ms > 20000) {
             return_batch_stopped = true;
             LOGE("[RETURN-DIAG] batch stopped: inventory did not update within 20s");
@@ -974,6 +1020,7 @@ void maybe_dispatch_return_batch() {
         return_batch_baseline_count = count;
         return_batch_dispatched_ms = now;
         return_batch_waiting = true;
+        return_batch_pending_id = utf8_string(task_id);
         append_return_trace("native-dispatch-batch", return_action_manager, task_id);
         const bool discard_postcard = return_discard_postcard();
         write_return_status("batch-dispatched", count, return_batch_completed, true, discard_postcard);
@@ -981,6 +1028,12 @@ void maybe_dispatch_return_batch() {
         if (async_task && gchandle_new) gchandle_new(async_task, false);
         LOGI("[RETURN-DIAG] batch dispatched task=%s async=%p", utf8_string(task_id).c_str(), async_task);
         return;
+    }
+    if (mode == "all") {
+        return_batch_stopped = true;
+        LOGI("[RETURN-DIAG] all mode completed: no due tasks remain");
+        write_return_status("all-complete-no-due", count, return_batch_completed, false,
+                            return_discard_postcard());
     }
 }
 void hooked_map_update(void *self, void *method_info) {
@@ -1029,6 +1082,9 @@ void start(const char *game_data_dir) {
     class_from_name = reinterpret_cast<ClassFromName>(xdl_sym(handle, "il2cpp_class_from_name", nullptr));
     class_get_method_from_name = reinterpret_cast<ClassGetMethodFromName>(
             xdl_sym(handle, "il2cpp_class_get_method_from_name", nullptr));
+    class_get_methods = reinterpret_cast<ClassGetMethods>(xdl_sym(handle, "il2cpp_class_get_methods", nullptr));
+    method_get_name = reinterpret_cast<MethodGetName>(xdl_sym(handle, "il2cpp_method_get_name", nullptr));
+    method_get_param_count = reinterpret_cast<MethodGetParamCount>(xdl_sym(handle, "il2cpp_method_get_param_count", nullptr));
     object_new = reinterpret_cast<ObjectNew>(xdl_sym(handle, "il2cpp_object_new", nullptr));
     string_new = reinterpret_cast<StringNew>(xdl_sym(handle, "il2cpp_string_new", nullptr));
     gchandle_new = reinterpret_cast<GcHandleNew>(xdl_sym(handle, "il2cpp_gchandle_new", nullptr));
@@ -1046,6 +1102,7 @@ void start(const char *game_data_dir) {
     std::snprintf(claim_log_path, sizeof(claim_log_path), "%s/files/nectar_claims.tsv", game_data_dir);
     std::snprintf(system_gps_path, sizeof(system_gps_path), "%s/files/nectar_system_gps.tsv", game_data_dir);
     std::snprintf(return_trace_path, sizeof(return_trace_path), "%s/files/return_rpc_trace.tsv", game_data_dir);
+    std::snprintf(return_history_path, sizeof(return_history_path), "%s/files/return_reward_history.tsv", game_data_dir);
     std::snprintf(return_mode_path, sizeof(return_mode_path), "%s/files/return_rpc_mode.txt", game_data_dir);
     std::snprintf(return_postcard_policy_path, sizeof(return_postcard_policy_path), "%s/files/return_postcard_policy.txt", game_data_dir);
     std::snprintf(return_status_path, sizeof(return_status_path), "%s/files/return_rpc_status.tsv", game_data_dir);
