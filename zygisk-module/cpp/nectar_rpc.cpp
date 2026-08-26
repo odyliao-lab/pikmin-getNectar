@@ -88,6 +88,7 @@ using GetInventoryItemId = void *(*)(void *, void *);
 using GetPikminTaskList = void *(*)(void *, void *);
 using GetPikminTaskProto = void *(*)(void *, void *);
 using GetTaskFinishTimeMs = int64_t (*)(void *, void *);
+using GetTaskVariant = void *(*)(void *, void *);
 using PikminTaskPreparerConstructor = void (*)(void *, void *, void *, void *, void *);
 using PikminTaskActionManagerConstructor = void (*)(void *, void *);
 
@@ -143,6 +144,17 @@ GetInventoryItemId get_inventory_item_id{};
 GetPikminTaskList original_get_pikmin_task_list{};
 GetPikminTaskProto get_pikmin_task_proto{};
 GetTaskFinishTimeMs get_task_finish_time_ms{};
+GetTaskVariant get_task_carry{};
+GetTaskVariant get_task_expedition{};
+GetTaskVariant get_task_gift{};
+GetTaskVariant get_task_poi_challenge{};
+GetTaskVariant get_expedition_fruit{};
+GetTaskVariant get_expedition_gift{};
+GetTaskVariant get_expedition_bloomed_poi{};
+GetTaskVariant get_expedition_postcard{};
+GetTaskVariant get_expedition_postcard_with_items{};
+GetTaskVariant get_bloomed_poi_reward_v2{};
+GetTaskVariant get_poi_reward_fruit{};
 PikminTaskPreparerConstructor original_pikmin_task_preparer_constructor{};
 PikminTaskActionManagerConstructor original_pikmin_task_action_manager_constructor{};
 TaskBool task_is_completed{};
@@ -185,6 +197,12 @@ int return_batch_completed{};
 long long return_batch_dispatched_ms{};
 std::string last_return_batch_mode;
 std::string return_batch_pending_id;
+std::string return_batch_pending_reward;
+bool return_reward_variant_metadata_logged[4]{};
+bool return_expedition_target_metadata_logged[5]{};
+bool return_bloomed_poi_reward_metadata_logged{};
+bool return_bloomed_poi_fruit_metadata_logged{};
+bool return_bloomed_poi_fruit_entry_metadata_logged{};
 void *pending_task{};
 uint32_t pending_task_handle{};
 std::string pending_id;
@@ -194,6 +212,7 @@ double pending_distance{};
 std::string last_result = "none";
 
 long long now_ms();
+void log_task_variant_metadata(void *proto);
 
 std::string utf8_string(void *value) {
     if (!value) return {};
@@ -225,11 +244,61 @@ void append_return_history(const char *event, int task_count, int completed,
                            bool waiting, bool discard_postcard) {
     FILE *file = std::fopen(return_history_path, "a");
     if (!file) return;
-    std::fprintf(file, "%lld\t%s\t%s\t%d\t%d\t%d\t%s\t%s\n", now_ms(), event,
+    std::fprintf(file, "%lld\t%s\t%s\t%d\t%d\t%d\t%s\t%s\t%s\n", now_ms(), event,
                  return_batch_pending_id.c_str(), task_count, completed, waiting ? 1 : 0,
-                 discard_postcard ? "discard" : "keep", last_return_batch_mode.c_str());
+                 discard_postcard ? "discard" : "keep", last_return_batch_mode.c_str(),
+                 return_batch_pending_reward.c_str());
     std::fclose(file);
     chmod(return_history_path, 0644);
+}
+
+const char *fruit_type_name(int type) {
+    switch (type) {
+        case 3: return "strawberry"; case 4: return "orange"; case 5: return "cherry";
+        case 6: return "melon"; case 8: return "peach"; case 27: return "lemon";
+        case 28: return "blueberry"; case 31: return "watermelon"; case 32: return "lime";
+        case 33: return "muscat-one"; case 34: return "kiwi"; case 35: return "green-apple";
+        case 36: return "muscat"; case 37: return "kumquat"; case 38: return "banana";
+        case 39: return "grapefruit"; case 40: return "apple"; case 41: return "prune";
+        case 42: return "grapes"; case 43: return "happy-fruit"; case 44: return "cut-kiwi";
+        case 45: return "fig"; case 46: return "loquat"; case 47: return "mangosteen";
+        default: return "unknown-fruit";
+    }
+}
+
+// v151 ResourceProto layout comes from the matching local metadata dump.
+// This is read-only and is limited to the known BloomedPoi reward path.
+std::string describe_return_reward(void *task) {
+    if (!task || !get_pikmin_task_proto || !get_task_expedition || !get_expedition_bloomed_poi ||
+        !get_bloomed_poi_reward_v2 || !get_poi_reward_fruit) return "task-reward-unavailable";
+    void *proto = get_pikmin_task_proto(task, nullptr);
+    void *expedition = proto ? get_task_expedition(proto, nullptr) : nullptr;
+    if (!expedition) return "task-type-non-expedition";
+    void *bloomed = get_expedition_bloomed_poi(expedition, nullptr);
+    if (!bloomed) return "expedition-target-non-bloomed-poi";
+    void *reward = get_bloomed_poi_reward_v2(bloomed, nullptr);
+    void *repeated = reward ? get_poi_reward_fruit(reward, nullptr) : nullptr;
+    if (!repeated) return "bloomed-poi:no-fruit";
+    auto *repeated_bytes = static_cast<uint8_t *>(repeated);
+    void *items = *reinterpret_cast<void **>(repeated_bytes + 0x10);
+    const int count = *reinterpret_cast<int *>(repeated_bytes + 0x18);
+    if (!items || count < 1 || count > 32) return "bloomed-poi:fruit-list-empty";
+    std::string result = "bloomed-poi:";
+    for (int index = 0; index < count; ++index) {
+        void *resource = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
+        if (!resource) continue;
+        auto *bytes = static_cast<uint8_t *>(resource);
+        const int type = *reinterpret_cast<int *>(bytes + 0x18);
+        const int pikmins = *reinterpret_cast<int *>(bytes + 0x1C);
+        const int grams = *reinterpret_cast<int *>(bytes + 0x2C);
+        const std::string flower = utf8_string(*reinterpret_cast<void **>(bytes + 0x20));
+        if (result.size() > 12) result += ",";
+        result += fruit_type_name(type);
+        result += " x" + std::to_string(pikmins);
+        if (!flower.empty()) result += "(" + flower + ")";
+        if (grams > 0) result += " " + std::to_string(grams) + "g";
+    }
+    return result == "bloomed-poi:" ? "bloomed-poi:fruit-list-empty" : result;
 }
 
 // Compact, replace-in-place status for the controller.  Unlike a dispatch
@@ -366,6 +435,7 @@ void dry_run_return_tasks() {
         if (finish_ms > 0 && finish_ms <= now) {
             ++due_count;
             append_return_trace("dry-run-finish-due", return_preparer, task_id);
+            log_task_variant_metadata(proto);
         }
     }
     LOGI("[RETURN-DIAG] dry-run tasks=%d preparerReady=%d finishDue=%d",
@@ -386,21 +456,90 @@ void *find_class(const char *namespc, const char *name) {
 // Metadata-only probe.  It never invokes an unknown method or touches a task;
 // it simply records the public method names exposed by this exact game build so
 // reward fields can be decoded without relying on guessed object offsets.
-void log_task_proto_methods(void *proto_class) {
+void log_class_methods(const char *label, void *proto_class) {
     if (!proto_class || !class_get_methods || !method_get_name || !method_get_param_count) return;
     void *iterator = nullptr;
     int logged{};
     while (void *method = class_get_methods(proto_class, &iterator)) {
         const char *name = method_get_name(method);
         if (!name) continue;
-        LOGI("[RETURN-META] PikminTaskProto method=%s params=%u", name,
+        LOGI("[RETURN-META] %s method=%s params=%u", label, name,
              method_get_param_count(method));
         if (++logged >= 160) {
             LOGE("[RETURN-META] method enumeration capped at 160 entries");
             break;
         }
     }
-    LOGI("[RETURN-META] PikminTaskProto metadata methods=%d", logged);
+    LOGI("[RETURN-META] %s metadata methods=%d", label, logged);
+}
+
+void log_task_proto_methods(void *proto_class) {
+    log_class_methods("PikminTaskProto", proto_class);
+}
+
+void log_task_variant_metadata(void *proto) {
+    if (!proto || !object_get_class || !class_get_name) return;
+    const GetTaskVariant getters[] = {get_task_carry, get_task_expedition, get_task_gift, get_task_poi_challenge};
+    const char *labels[] = {"Carry", "Expedition", "Gift", "PoiChallenge"};
+    for (int index = 0; index < 4; ++index) {
+        if (!getters[index] || return_reward_variant_metadata_logged[index]) continue;
+        void *variant = getters[index](proto, nullptr);
+        if (!variant) continue;
+        void *klass = object_get_class(variant);
+        const char *name = klass ? class_get_name(klass) : "unknown";
+        LOGI("[RETURN-META] active task variant=%s class=%s", labels[index], name ? name : "unknown");
+        log_class_methods(labels[index], klass);
+        if (index == 1) {
+            const GetTaskVariant getters[] = {get_expedition_fruit, get_expedition_gift,
+                    get_expedition_bloomed_poi, get_expedition_postcard, get_expedition_postcard_with_items};
+            const char *target_labels[] = {"Fruit", "ExpeditionGift", "BloomedPoi", "Postcard", "PostcardWithItems"};
+            for (int target = 0; target < 5; ++target) {
+                if (!getters[target] || return_expedition_target_metadata_logged[target]) continue;
+                void *value = getters[target](variant, nullptr);
+                if (!value) continue;
+                void *value_class = object_get_class(value);
+                const char *value_name = value_class ? class_get_name(value_class) : "unknown";
+                LOGI("[RETURN-META] active expedition target=%s class=%s", target_labels[target],
+                     value_name ? value_name : "unknown");
+                log_class_methods(target_labels[target], value_class);
+                if (target == 2 && get_bloomed_poi_reward_v2 && !return_bloomed_poi_reward_metadata_logged) {
+                    void *reward = get_bloomed_poi_reward_v2(value, nullptr);
+                    if (reward) {
+                        void *reward_class = object_get_class(reward);
+                        const char *reward_name = reward_class ? class_get_name(reward_class) : "unknown";
+                        LOGI("[RETURN-META] BloomedPoi RewardV2 class=%s", reward_name ? reward_name : "unknown");
+                        log_class_methods("BloomedPoiRewardV2", reward_class);
+                        return_bloomed_poi_reward_metadata_logged = true;
+                        if (get_poi_reward_fruit && !return_bloomed_poi_fruit_metadata_logged) {
+                            void *fruit = get_poi_reward_fruit(reward, nullptr);
+                            if (fruit) {
+                                void *fruit_class = object_get_class(fruit);
+                                const char *fruit_name = fruit_class ? class_get_name(fruit_class) : "unknown";
+                                LOGI("[RETURN-META] BloomedPoi Fruit class=%s", fruit_name ? fruit_name : "unknown");
+                                log_class_methods("BloomedPoiFruit", fruit_class);
+                                return_bloomed_poi_fruit_metadata_logged = true;
+                                auto *repeated = static_cast<uint8_t *>(fruit);
+                                void *items = *reinterpret_cast<void **>(repeated + 0x10);
+                                const int count = *reinterpret_cast<int *>(repeated + 0x18);
+                                if (!return_bloomed_poi_fruit_entry_metadata_logged && items && count > 0 && count <= 32) {
+                                    void *entry = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20);
+                                    void *entry_class = entry ? object_get_class(entry) : nullptr;
+                                    const char *entry_name = entry_class ? class_get_name(entry_class) : "unknown";
+                                    LOGI("[RETURN-META] BloomedPoi Fruit entry class=%s count=%d",
+                                         entry_name ? entry_name : "unknown", count);
+                                    log_class_methods("BloomedPoiFruitEntry", entry_class);
+                                    return_bloomed_poi_fruit_entry_metadata_logged = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                return_expedition_target_metadata_logged[target] = true;
+            }
+        }
+        return_reward_variant_metadata_logged[index] = true;
+        return;
+    }
 }
 
 void install_return_diagnostic_hook() {
@@ -490,6 +629,32 @@ void install_return_diagnostic_hook() {
     }
     get_pikmin_task_proto = reinterpret_cast<GetPikminTaskProto>(proto_entry);
     get_task_finish_time_ms = reinterpret_cast<GetTaskFinishTimeMs>(finish_entry);
+    void *carry = proto_class ? class_get_method_from_name(proto_class, "get_Carry", 0) : nullptr;
+    void *expedition = proto_class ? class_get_method_from_name(proto_class, "get_Expedition", 0) : nullptr;
+    void *gift = proto_class ? class_get_method_from_name(proto_class, "get_Gift", 0) : nullptr;
+    void *poi_challenge = proto_class ? class_get_method_from_name(proto_class, "get_PoiChallenge", 0) : nullptr;
+    get_task_carry = carry ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(carry)) : nullptr;
+    get_task_expedition = expedition ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(expedition)) : nullptr;
+    get_task_gift = gift ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(gift)) : nullptr;
+    get_task_poi_challenge = poi_challenge ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(poi_challenge)) : nullptr;
+    void *expedition_class = find_class("Ichigo.Proto", "ExpeditionTaskProto");
+    const char *target_getters[] = {"get_Fruit", "get_Gift", "get_BloomedPoi", "get_Postcard", "get_PostcardWithItems"};
+    GetTaskVariant *target_functions[] = {&get_expedition_fruit, &get_expedition_gift,
+            &get_expedition_bloomed_poi, &get_expedition_postcard, &get_expedition_postcard_with_items};
+    for (int index = 0; index < 5; ++index) {
+        void *method = expedition_class ? class_get_method_from_name(expedition_class, target_getters[index], 0) : nullptr;
+        *target_functions[index] = method ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(method)) : nullptr;
+    }
+    void *bloomed_poi_class = find_class("Ichigo.Proto", "PoiFlowerBloomedRewardProto");
+    void *reward_v2 = bloomed_poi_class
+            ? class_get_method_from_name(bloomed_poi_class, "get_RewardV2", 0) : nullptr;
+    get_bloomed_poi_reward_v2 = reward_v2
+            ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(reward_v2)) : nullptr;
+    void *poi_reward_class = find_class("Ichigo.Proto", "PoiRewardProto");
+    void *poi_reward_fruit = poi_reward_class
+            ? class_get_method_from_name(poi_reward_class, "get_Fruit", 0) : nullptr;
+    get_poi_reward_fruit = poi_reward_fruit
+            ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(poi_reward_fruit)) : nullptr;
     A64HookFunction(list_entry, reinterpret_cast<void *>(hooked_get_pikmin_task_list),
                     reinterpret_cast<void **>(&original_get_pikmin_task_list));
     LOGI("[RETURN-DIAG] task-list hook installed method=%p entry=%p", list_method, list_entry);
@@ -964,6 +1129,7 @@ void maybe_dispatch_return_batch() {
             return_batch_baseline_count = 0;
             return_batch_completed = 0;
             return_batch_pending_id.clear();
+            return_batch_pending_reward.clear();
         }
         last_return_batch_mode = mode;
         return;
@@ -974,6 +1140,7 @@ void maybe_dispatch_return_batch() {
         return_batch_baseline_count = 0;
         return_batch_completed = 0;
         return_batch_pending_id.clear();
+        return_batch_pending_reward.clear();
         last_return_batch_mode = mode;
     }
     if (return_batch_stopped || !return_action_manager ||
@@ -993,6 +1160,7 @@ void maybe_dispatch_return_batch() {
             write_return_status("batch-confirmed", count, return_batch_completed, false,
                                 return_discard_postcard());
             return_batch_pending_id.clear();
+            return_batch_pending_reward.clear();
         } else if (now - return_batch_dispatched_ms > 20000) {
             return_batch_stopped = true;
             LOGE("[RETURN-DIAG] batch stopped: inventory did not update within 20s");
@@ -1021,6 +1189,7 @@ void maybe_dispatch_return_batch() {
         return_batch_dispatched_ms = now;
         return_batch_waiting = true;
         return_batch_pending_id = utf8_string(task_id);
+        return_batch_pending_reward = describe_return_reward(task);
         append_return_trace("native-dispatch-batch", return_action_manager, task_id);
         const bool discard_postcard = return_discard_postcard();
         write_return_status("batch-dispatched", count, return_batch_completed, true, discard_postcard);
