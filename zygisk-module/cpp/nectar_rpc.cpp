@@ -157,6 +157,7 @@ char system_gps_path[512]{};
 char return_trace_path[512]{};
 char return_mode_path[512]{};
 char return_postcard_policy_path[512]{};
+char return_status_path[512]{};
 std::map<std::string, FlowerRecord> flowers;
 std::map<std::string, std::string> last_flower_state;
 long long last_tick_ms{};
@@ -204,6 +205,18 @@ void append_return_trace(const char *event, void *self, void *task_id) {
     std::fprintf(file, "%lld\t%s\t%p\t%s\n", now_ms(), event, self, id.c_str());
     std::fclose(file);
     chmod(return_trace_path, 0644);
+}
+
+// Compact, replace-in-place status for the controller.  Unlike a dispatch
+// trace, "batch-confirmed" is emitted only after the live inventory count
+// decreases, so the APK can distinguish a request from a completed claim.
+void write_return_status(const char *event, int task_count, int completed, bool waiting, bool discard_postcard) {
+    FILE *file = std::fopen(return_status_path, "w");
+    if (!file) return;
+    std::fprintf(file, "%lld\t%s\t%d\t%d\t%d\t%s\n", now_ms(), event, task_count,
+                 completed, waiting ? 1 : 0, discard_postcard ? "discard" : "keep");
+    std::fclose(file);
+    chmod(return_status_path, 0644);
 }
 
 void *hooked_complete_pikmin_task(void *self, void *task_id, bool discard_postcard, void *method_info) {
@@ -888,15 +901,21 @@ void maybe_dispatch_return_batch() {
             return_batch_waiting = false;
             ++return_batch_completed;
             LOGI("[RETURN-DIAG] batch confirmed completed=%d", return_batch_completed);
+            write_return_status("batch-confirmed", count, return_batch_completed, false,
+                                return_discard_postcard());
         } else if (now - return_batch_dispatched_ms > 20000) {
             return_batch_stopped = true;
             LOGE("[RETURN-DIAG] batch stopped: inventory did not update within 20s");
+            write_return_status("batch-stopped-timeout", count, return_batch_completed, true,
+                                return_discard_postcard());
         }
         return;
     }
     if (return_batch_completed >= 5) {
         return_batch_stopped = true;
         LOGI("[RETURN-DIAG] batch paused after five confirmed completions");
+        write_return_status("batch-paused-limit", count, return_batch_completed, false,
+                            return_discard_postcard());
         return;
     }
     for (int index = 0; index < count; ++index) {
@@ -912,6 +931,7 @@ void maybe_dispatch_return_batch() {
         return_batch_waiting = true;
         append_return_trace("native-dispatch-batch", return_action_manager, task_id);
         const bool discard_postcard = return_discard_postcard();
+        write_return_status("batch-dispatched", count, return_batch_completed, true, discard_postcard);
         void *async_task = original_complete_pikmin_task(return_action_manager, task_id, discard_postcard, nullptr);
         if (async_task && gchandle_new) gchandle_new(async_task, false);
         LOGI("[RETURN-DIAG] batch dispatched task=%s async=%p", utf8_string(task_id).c_str(), async_task);
@@ -983,6 +1003,7 @@ void start(const char *game_data_dir) {
     std::snprintf(return_trace_path, sizeof(return_trace_path), "%s/files/return_rpc_trace.tsv", game_data_dir);
     std::snprintf(return_mode_path, sizeof(return_mode_path), "%s/files/return_rpc_mode.txt", game_data_dir);
     std::snprintf(return_postcard_policy_path, sizeof(return_postcard_policy_path), "%s/files/return_postcard_policy.txt", game_data_dir);
+    std::snprintf(return_status_path, sizeof(return_status_path), "%s/files/return_rpc_status.tsv", game_data_dir);
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);
