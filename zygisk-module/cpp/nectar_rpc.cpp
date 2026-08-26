@@ -160,6 +160,7 @@ char return_mode_path[512]{};
 char return_postcard_policy_path[512]{};
 char return_status_path[512]{};
 char return_batch_limit_path[512]{};
+char compatibility_path[512]{};
 std::map<std::string, FlowerRecord> flowers;
 std::map<std::string, std::string> last_flower_state;
 long long last_tick_ms{};
@@ -220,6 +221,15 @@ void write_return_status(const char *event, int task_count, int completed, bool 
                  completed, waiting ? 1 : 0, discard_postcard ? "discard" : "keep");
     std::fclose(file);
     chmod(return_status_path, 0644);
+}
+
+void write_compatibility_status(bool compatible, off_t observed_size) {
+    FILE *file = std::fopen(compatibility_path, "w");
+    if (!file) return;
+    std::fprintf(file, "v151\t%s\t%lld\t%lld\n", compatible ? "compatible" : "incompatible",
+                 static_cast<long long>(kExpectedIl2CppSize), static_cast<long long>(observed_size));
+    std::fclose(file);
+    chmod(compatibility_path, 0644);
 }
 
 void *hooked_complete_pikmin_task(void *self, void *task_id, bool discard_postcard, void *method_info) {
@@ -1039,6 +1049,7 @@ void start(const char *game_data_dir) {
     std::snprintf(return_postcard_policy_path, sizeof(return_postcard_policy_path), "%s/files/return_postcard_policy.txt", game_data_dir);
     std::snprintf(return_status_path, sizeof(return_status_path), "%s/files/return_rpc_status.tsv", game_data_dir);
     std::snprintf(return_batch_limit_path, sizeof(return_batch_limit_path), "%s/files/return_batch_limit.txt", game_data_dir);
+    std::snprintf(compatibility_path, sizeof(compatibility_path), "%s/files/compatibility_status.tsv", game_data_dir);
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);
@@ -1046,9 +1057,11 @@ void start(const char *game_data_dir) {
     struct stat il2cpp_stat{};
     if (!info.dli_fname || stat(info.dli_fname, &il2cpp_stat) != 0
             || il2cpp_stat.st_size != kExpectedIl2CppSize) {
+        write_compatibility_status(false, info.dli_fname ? il2cpp_stat.st_size : 0);
         LOGE("[NECTAR] unsupported libil2cpp.so; hooks were not installed");
         return;
     }
+    write_compatibility_status(true, il2cpp_stat.st_size);
     task_is_completed = reinterpret_cast<TaskBool>(base + kTaskIsCompletedRva);
     task_is_faulted = reinterpret_cast<TaskBool>(base + kTaskIsFaultedRva);
 
