@@ -911,10 +911,11 @@ void maybe_dispatch_one_return_task() {
 
 void maybe_dispatch_return_batch() {
     const std::string mode = read_return_mode();
-    if (mode != "batch") {
+    const bool automatic_batch = mode == "batch" || mode == "all";
+    if (!automatic_batch) {
         // Leaving batch mode explicitly re-arms the next batch, without
         // allowing a paused process to restart itself unexpectedly.
-        if (last_return_batch_mode == "batch") {
+        if (last_return_batch_mode == "batch" || last_return_batch_mode == "all") {
             return_batch_waiting = false;
             return_batch_stopped = false;
             return_batch_baseline_count = 0;
@@ -923,12 +924,12 @@ void maybe_dispatch_return_batch() {
         last_return_batch_mode = mode;
         return;
     }
-    if (last_return_batch_mode != "batch") {
+    if (last_return_batch_mode != mode) {
         return_batch_waiting = false;
         return_batch_stopped = false;
         return_batch_baseline_count = 0;
         return_batch_completed = 0;
-        last_return_batch_mode = "batch";
+        last_return_batch_mode = mode;
     }
     if (return_batch_stopped || !return_action_manager ||
         !return_inventory_manager || !original_get_pikmin_task_list || !original_complete_pikmin_task ||
@@ -954,7 +955,7 @@ void maybe_dispatch_return_batch() {
         }
         return;
     }
-    const int batch_limit = return_batch_limit();
+    const int batch_limit = mode == "all" ? INT32_MAX : return_batch_limit();
     if (return_batch_completed >= batch_limit) {
         return_batch_stopped = true;
         LOGI("[RETURN-DIAG] batch paused after %d confirmed completions", batch_limit);

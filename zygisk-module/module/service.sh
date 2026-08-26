@@ -44,7 +44,7 @@ chmod 0644 "$RETURN_BATCH_LIMIT"
       # channel before exposing it to the game process.
       if [ -r "$ADB_RETURN_CONTROL" ]; then
         case "$(cat "$ADB_RETURN_CONTROL" 2>/dev/null)" in
-          dry-run|one|batch|off) cp "$ADB_RETURN_CONTROL" "$RETURN_CONTROL_MODE" 2>/dev/null ;;
+          dry-run|one|batch|all|off) cp "$ADB_RETURN_CONTROL" "$RETURN_CONTROL_MODE" 2>/dev/null ;;
         esac
       fi
       cp "$RETURN_CONTROL_MODE" "$GAME_RETURN_MODE" 2>/dev/null
