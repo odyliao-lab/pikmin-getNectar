@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cerrno>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <ifaddrs.h>
 #include <map>
@@ -158,6 +159,7 @@ char return_trace_path[512]{};
 char return_mode_path[512]{};
 char return_postcard_policy_path[512]{};
 char return_status_path[512]{};
+char return_batch_limit_path[512]{};
 std::map<std::string, FlowerRecord> flowers;
 std::map<std::string, std::string> last_flower_state;
 long long last_tick_ms{};
@@ -173,6 +175,7 @@ bool return_batch_stopped{};
 int return_batch_baseline_count{};
 int return_batch_completed{};
 long long return_batch_dispatched_ms{};
+std::string last_return_batch_mode;
 void *pending_task{};
 uint32_t pending_task_handle{};
 std::string pending_id;
@@ -855,6 +858,16 @@ bool return_discard_postcard() {
     return std::strncmp(value, "discard", 7) == 0;
 }
 
+int return_batch_limit() {
+    FILE *file = std::fopen(return_batch_limit_path, "r");
+    if (!file) return 5;
+    char value[16]{};
+    std::fgets(value, sizeof(value), file);
+    std::fclose(file);
+    const long parsed = std::strtol(value, nullptr, 10);
+    return parsed >= 1 && parsed <= 5 ? static_cast<int>(parsed) : 5;
+}
+
 // One-shot native validation.  This is intentionally separate from dry-run:
 // it can dispatch at most one server-backed completion in a process lifetime.
 void maybe_dispatch_one_return_task() {
@@ -887,7 +900,27 @@ void maybe_dispatch_one_return_task() {
 }
 
 void maybe_dispatch_return_batch() {
-    if (read_return_mode() != "batch" || return_batch_stopped || !return_action_manager ||
+    const std::string mode = read_return_mode();
+    if (mode != "batch") {
+        // Leaving batch mode explicitly re-arms the next batch, without
+        // allowing a paused process to restart itself unexpectedly.
+        if (last_return_batch_mode == "batch") {
+            return_batch_waiting = false;
+            return_batch_stopped = false;
+            return_batch_baseline_count = 0;
+            return_batch_completed = 0;
+        }
+        last_return_batch_mode = mode;
+        return;
+    }
+    if (last_return_batch_mode != "batch") {
+        return_batch_waiting = false;
+        return_batch_stopped = false;
+        return_batch_baseline_count = 0;
+        return_batch_completed = 0;
+        last_return_batch_mode = "batch";
+    }
+    if (return_batch_stopped || !return_action_manager ||
         !return_inventory_manager || !original_get_pikmin_task_list || !original_complete_pikmin_task ||
         !get_inventory_item_id || !get_pikmin_task_proto || !get_task_finish_time_ms) return;
     void *list = original_get_pikmin_task_list(return_inventory_manager, nullptr);
@@ -911,9 +944,10 @@ void maybe_dispatch_return_batch() {
         }
         return;
     }
-    if (return_batch_completed >= 5) {
+    const int batch_limit = return_batch_limit();
+    if (return_batch_completed >= batch_limit) {
         return_batch_stopped = true;
-        LOGI("[RETURN-DIAG] batch paused after five confirmed completions");
+        LOGI("[RETURN-DIAG] batch paused after %d confirmed completions", batch_limit);
         write_return_status("batch-paused-limit", count, return_batch_completed, false,
                             return_discard_postcard());
         return;
@@ -1004,6 +1038,7 @@ void start(const char *game_data_dir) {
     std::snprintf(return_mode_path, sizeof(return_mode_path), "%s/files/return_rpc_mode.txt", game_data_dir);
     std::snprintf(return_postcard_policy_path, sizeof(return_postcard_policy_path), "%s/files/return_postcard_policy.txt", game_data_dir);
     std::snprintf(return_status_path, sizeof(return_status_path), "%s/files/return_rpc_status.tsv", game_data_dir);
+    std::snprintf(return_batch_limit_path, sizeof(return_batch_limit_path), "%s/files/return_batch_limit.txt", game_data_dir);
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);

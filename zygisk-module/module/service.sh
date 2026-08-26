@@ -9,10 +9,13 @@ RETURN_CONTROL_MODE="$MODDIR/return_control_mode.txt"
 ADB_RETURN_CONTROL="/data/local/tmp/pikmin-return-mode.txt"
 RETURN_POSTCARD_POLICY="$MODDIR/return_postcard_policy.txt"
 ADB_RETURN_POSTCARD_POLICY="/data/local/tmp/pikmin-return-postcard-policy.txt"
+RETURN_BATCH_LIMIT="$MODDIR/return_batch_limit.txt"
+ADB_RETURN_BATCH_LIMIT="/data/local/tmp/pikmin-return-batch-limit.txt"
 PUBLIC_STATUS="$MODDIR/nectar_status.tsv"
 GAME_MODE="$GAME_FILES/nectar_rpc_mode.txt"
 GAME_RETURN_MODE="$GAME_FILES/return_rpc_mode.txt"
 GAME_RETURN_POSTCARD_POLICY="$GAME_FILES/return_postcard_policy.txt"
+GAME_RETURN_BATCH_LIMIT="$GAME_FILES/return_batch_limit.txt"
 GAME_STATUS="$GAME_FILES/nectar_status.tsv"
 GAME_GPS="$GAME_FILES/nectar_system_gps.tsv"
 GAME_RETURN_TRACE="$GAME_FILES/return_rpc_trace.tsv"
@@ -21,9 +24,11 @@ PUBLIC_RETURN_TRACE="$MODDIR/return_rpc_trace.tsv"
 [ -f "$CONTROL_MODE" ] || printf 'diag\n' >"$CONTROL_MODE"
 [ -f "$RETURN_CONTROL_MODE" ] || printf 'dry-run\n' >"$RETURN_CONTROL_MODE"
 [ -f "$RETURN_POSTCARD_POLICY" ] || printf 'keep\n' >"$RETURN_POSTCARD_POLICY"
+[ -f "$RETURN_BATCH_LIMIT" ] || printf '5\n' >"$RETURN_BATCH_LIMIT"
 chmod 0644 "$CONTROL_MODE"
 chmod 0644 "$RETURN_CONTROL_MODE"
 chmod 0644 "$RETURN_POSTCARD_POLICY"
+chmod 0644 "$RETURN_BATCH_LIMIT"
 
 (
   while true; do
@@ -51,6 +56,13 @@ chmod 0644 "$RETURN_POSTCARD_POLICY"
       fi
       cp "$RETURN_POSTCARD_POLICY" "$GAME_RETURN_POSTCARD_POLICY" 2>/dev/null
       chmod 0644 "$GAME_RETURN_POSTCARD_POLICY" 2>/dev/null
+      if [ -r "$ADB_RETURN_BATCH_LIMIT" ]; then
+        case "$(cat "$ADB_RETURN_BATCH_LIMIT" 2>/dev/null)" in
+          1|2|3|4|5) cp "$ADB_RETURN_BATCH_LIMIT" "$RETURN_BATCH_LIMIT" 2>/dev/null ;;
+        esac
+      fi
+      cp "$RETURN_BATCH_LIMIT" "$GAME_RETURN_BATCH_LIMIT" 2>/dev/null
+      chmod 0644 "$GAME_RETURN_BATCH_LIMIT" 2>/dev/null
     fi
     # Publish diagnostic data for the controller without granting it access to
     # Pikmin Bloom's private directory.
