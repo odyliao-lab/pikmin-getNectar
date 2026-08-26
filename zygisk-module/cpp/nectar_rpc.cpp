@@ -268,6 +268,31 @@ const char *fruit_type_name(int type) {
     }
 }
 
+const char *flower_kind_name(int kind) {
+    switch (kind) {
+        case 1: return "sunflower"; case 2: return "tulip"; case 3: return "pansy";
+        case 4: return "rose"; case 5: return "common"; case 6: return "poinsettia";
+        case 7: return "camellia"; case 8: return "plumblossom"; case 9: return "narcissus";
+        case 10: return "cherryblossom"; case 11: return "nemophila"; case 12: return "carnation";
+        case 13: return "callalily"; case 14: return "hydrangea"; case 15: return "lilium";
+        case 16: return "hibiscus"; case 17: return "plumeria"; case 18: return "clusteramaryllis";
+        case 19: return "cosmos"; case 20: return "cyclamen"; case 21: return "anemone";
+        case 22: return "dianthus"; case 23: return "gentian"; case 24: return "chrysanthemum";
+        case 25: return "hellebore"; case 26: return "cattleya"; case 27: return "hyacinth";
+        case 28: return "sweetpea"; case 29: return "convallaria"; case 30: return "peony";
+        case 31: return "nymphaea"; case 32: return "morningglory"; case 33: return "bougainvillea";
+        case 34: return "dahlia"; case 35: return "clematis"; case 36: return "snowdrop";
+        case 37: return "freesia"; case 38: return "canola"; case 39: return "rose2025";
+        case 40: return "iris"; case 41: return "strelitzia"; case 42: return "celosia";
+        case 43: return "marigold"; case 44: return "salvia"; case 45: return "primula";
+        case 46: return "mothorchid"; case 47: return "snapdragon"; case 48: return "petunia";
+        case 49: return "tulip2026"; case 50: return "forgetmenot"; case 51: return "poppy";
+        case 52: return "bellflower"; case 53: return "epiphyllum"; case 54: return "canna";
+        case 55: return "lisianthus"; case 56: return "thistle"; case 57: return "geranium";
+        case 58: return "oxalis"; default: return "unknown-flower";
+    }
+}
+
 // v151 ResourceProto layout comes from the matching local metadata dump.
 // This is read-only and is limited to the known BloomedPoi reward path.
 std::string describe_return_reward(void *task) {
@@ -294,10 +319,12 @@ std::string describe_return_reward(void *task) {
         const int pikmins = *reinterpret_cast<int *>(bytes + 0x1C);
         const int grams = *reinterpret_cast<int *>(bytes + 0x2C);
         const std::string flower = utf8_string(*reinterpret_cast<void **>(bytes + 0x20));
+        const int flower_kind = *reinterpret_cast<int *>(bytes + 0x28);
         if (result.size() > 12) result += ",";
         result += fruit_type_name(type);
         result += " x" + std::to_string(pikmins);
-        if (!flower.empty()) result += "(" + flower + ")";
+        if (!flower.empty()) result += " flower=" + flower;
+        else if (flower_kind > 0) result += " flower=" + std::string(flower_kind_name(flower_kind));
         if (grams > 0) result += " " + std::to_string(grams) + "g";
     }
     return result == "bloomed-poi:" ? "bloomed-poi:fruit-list-empty" : result;
