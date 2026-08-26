@@ -89,6 +89,7 @@ using GetPikminTaskList = void *(*)(void *, void *);
 using GetPikminTaskProto = void *(*)(void *, void *);
 using GetTaskFinishTimeMs = int64_t (*)(void *, void *);
 using GetTaskVariant = void *(*)(void *, void *);
+using GetTaskInt = int (*)(void *, void *);
 using PikminTaskPreparerConstructor = void (*)(void *, void *, void *, void *, void *);
 using PikminTaskActionManagerConstructor = void (*)(void *, void *);
 
@@ -155,6 +156,9 @@ GetTaskVariant get_expedition_postcard{};
 GetTaskVariant get_expedition_postcard_with_items{};
 GetTaskVariant get_bloomed_poi_reward_v2{};
 GetTaskVariant get_poi_reward_fruit{};
+GetTaskVariant get_carry_resource{};
+GetTaskVariant get_carry_pikmin_seed{};
+GetTaskInt get_seed_type{};
 PikminTaskPreparerConstructor original_pikmin_task_preparer_constructor{};
 PikminTaskActionManagerConstructor original_pikmin_task_action_manager_constructor{};
 TaskBool task_is_completed{};
@@ -296,9 +300,17 @@ const char *flower_kind_name(int kind) {
 // v151 ResourceProto layout comes from the matching local metadata dump.
 // This is read-only and is limited to the known BloomedPoi reward path.
 std::string describe_return_reward(void *task) {
-    if (!task || !get_pikmin_task_proto || !get_task_expedition || !get_expedition_bloomed_poi ||
-        !get_bloomed_poi_reward_v2 || !get_poi_reward_fruit) return "task-reward-unavailable";
+    if (!task || !get_pikmin_task_proto) return "task-reward-unavailable";
     void *proto = get_pikmin_task_proto(task, nullptr);
+    void *carry = proto && get_task_carry ? get_task_carry(proto, nullptr) : nullptr;
+    if (carry) {
+        void *seed = get_carry_pikmin_seed ? get_carry_pikmin_seed(carry, nullptr) : nullptr;
+        if (seed && get_seed_type) return "carry:seed:" + std::to_string(get_seed_type(seed, nullptr));
+        if (get_carry_resource && get_carry_resource(carry, nullptr)) return "carry:resource";
+        return "carry:unknown";
+    }
+    if (!get_task_expedition || !get_expedition_bloomed_poi || !get_bloomed_poi_reward_v2 || !get_poi_reward_fruit)
+        return "task-reward-unavailable";
     void *expedition = proto ? get_task_expedition(proto, nullptr) : nullptr;
     if (!expedition) return "task-type-non-expedition";
     void *bloomed = get_expedition_bloomed_poi(expedition, nullptr);
@@ -666,6 +678,14 @@ void install_return_diagnostic_hook() {
     get_task_expedition = expedition ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(expedition)) : nullptr;
     get_task_gift = gift ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(gift)) : nullptr;
     get_task_poi_challenge = poi_challenge ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(poi_challenge)) : nullptr;
+    void *carry_class = find_class("Ichigo.Proto", "CarryTaskProto");
+    void *carry_resource = carry_class ? class_get_method_from_name(carry_class, "get_Resource", 0) : nullptr;
+    void *carry_seed = carry_class ? class_get_method_from_name(carry_class, "get_PikminSeed", 0) : nullptr;
+    get_carry_resource = carry_resource ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(carry_resource)) : nullptr;
+    get_carry_pikmin_seed = carry_seed ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(carry_seed)) : nullptr;
+    void *seed_class = find_class("Ichigo.Proto", "PikminSeedProto");
+    void *seed_type = seed_class ? class_get_method_from_name(seed_class, "get_SeedType", 0) : nullptr;
+    get_seed_type = seed_type ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(seed_type)) : nullptr;
     void *expedition_class = find_class("Ichigo.Proto", "ExpeditionTaskProto");
     const char *target_getters[] = {"get_Fruit", "get_Gift", "get_BloomedPoi", "get_Postcard", "get_PostcardWithItems"};
     GetTaskVariant *target_functions[] = {&get_expedition_fruit, &get_expedition_gift,
@@ -940,7 +960,9 @@ void maybe_claim() {
     if (mode == "test_once" && test_once_sent) return;
     if (pending_task) return;
     load_test_target();
-    if (!rpc_manager || !online || !planting) {
+    // Claiming a visible big flower only needs a live game RPC session and a
+    // location.  Flower planting is unrelated and must not gate collection.
+    if (!rpc_manager || !online) {
         if (current - last_status_ms >= 5000) {
             last_status_ms = current;
             LOGI("[NECTAR-DIAG] waiting rpc=%d online=%d planting=%d flowers=%zu mode=%s",
@@ -1244,8 +1266,7 @@ void maybe_dispatch_return_batch() {
         return;
     }
     if (mode == "all") {
-        return_batch_stopped = true;
-        LOGI("[RETURN-DIAG] all mode completed: no due tasks remain");
+        LOGI("[RETURN-DIAG] all mode idle: no due tasks remain; it will re-arm when a task appears");
         write_return_status("all-complete-no-due", count, return_batch_completed, false,
                             return_discard_postcard());
     }
