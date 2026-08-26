@@ -82,6 +82,15 @@ chmod 0644 "$RETURN_BATCH_LIMIT"
       cp "$GAME_RETURN_HISTORY" "$PUBLIC_RETURN_HISTORY" 2>/dev/null
       chmod 0644 "$PUBLIC_RETURN_HISTORY" 2>/dev/null
     fi
+    # Reward history is an operator log, not an archive. Keep one rolling day
+    # in both namespaces so the controller never accumulates unbounded rows.
+    RETURN_CUTOFF="$(($(date +%s) * 1000 - 86400000))"
+    for RETURN_LOG in "$GAME_RETURN_HISTORY" "$PUBLIC_RETURN_HISTORY"; do
+      [ -f "$RETURN_LOG" ] || continue
+      awk -F '\t' -v cutoff="$RETURN_CUTOFF" '$1 >= cutoff' "$RETURN_LOG" >"$RETURN_LOG.tmp" 2>/dev/null &&
+        cat "$RETURN_LOG.tmp" >"$RETURN_LOG" 2>/dev/null
+      rm -f "$RETURN_LOG.tmp"
+    done
     if [ -r "$GAME_CLAIMS" ]; then
       cp "$GAME_CLAIMS" "$PUBLIC_CLAIMS" 2>/dev/null
       chmod 0644 "$PUBLIC_CLAIMS" 2>/dev/null
