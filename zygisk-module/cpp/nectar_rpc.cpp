@@ -150,6 +150,7 @@ GetTaskVariant get_task_expedition{};
 GetTaskVariant get_task_gift{};
 GetTaskVariant get_task_poi_challenge{};
 GetTaskVariant get_expedition_fruit{};
+GetTaskVariant get_expedition_seed{};
 GetTaskVariant get_expedition_gift{};
 GetTaskVariant get_expedition_bloomed_poi{};
 GetTaskVariant get_expedition_postcard{};
@@ -159,6 +160,15 @@ GetTaskVariant get_poi_reward_fruit{};
 GetTaskVariant get_carry_resource{};
 GetTaskVariant get_carry_pikmin_seed{};
 GetTaskInt get_seed_type{};
+GetTaskVariant get_seed_pikmin{};
+GetTaskInt get_pikmin_type{};
+GetTaskInt get_pikmin_category{};
+GetTaskInt get_gift_item_case{};
+GetTaskVariant get_gift_deco{};
+GetTaskVariant get_gift_rare_deco{};
+GetTaskVariant get_deco_pikmin_type{};
+GetTaskInt get_deco_box_type{};
+GetTaskInt get_rare_deco_category{};
 GetTaskInt get_task_case{};
 GetTaskInt get_expedition_target_case{};
 GetTaskInt get_resource_type{};
@@ -218,7 +228,7 @@ std::string last_return_batch_mode;
 std::string return_batch_pending_id;
 std::string return_batch_pending_reward;
 bool return_reward_variant_metadata_logged[4]{};
-bool return_expedition_target_metadata_logged[5]{};
+bool return_expedition_target_metadata_logged[6]{};
 bool return_bloomed_poi_reward_metadata_logged{};
 bool return_bloomed_poi_fruit_metadata_logged{};
 bool return_bloomed_poi_fruit_entry_metadata_logged{};
@@ -371,6 +381,39 @@ std::string describe_resource(void *resource) {
     return result;
 }
 
+// Seed and gift targets contain their reward description before completion.
+// Record only public protobuf fields so the history can be displayed without
+// guessing from the post-completion inventory delta.
+std::string describe_seed(void *seed) {
+    if (!seed) return "seed:unavailable";
+    const int seed_type = get_seed_type ? get_seed_type(seed, nullptr) : 0;
+    void *pikmin = get_seed_pikmin ? get_seed_pikmin(seed, nullptr) : nullptr;
+    const int pikmin_type = pikmin && get_pikmin_type ? get_pikmin_type(pikmin, nullptr) : 0;
+    const int category = pikmin && get_pikmin_category ? get_pikmin_category(pikmin, nullptr) : 0;
+    return "seed:" + std::to_string(seed_type) + ":pikmin:" + std::to_string(pikmin_type)
+            + ":category:" + std::to_string(category);
+}
+
+std::string describe_gift(void *gift) {
+    if (!gift) return "gift:unavailable";
+    const int item_case = get_gift_item_case ? get_gift_item_case(gift, nullptr) : 0;
+    void *deco = get_gift_deco ? get_gift_deco(gift, nullptr) : nullptr;
+    if (deco) {
+        void *pikmin = get_deco_pikmin_type ? get_deco_pikmin_type(deco, nullptr) : nullptr;
+        const int pikmin_type = pikmin && get_pikmin_type ? get_pikmin_type(pikmin, nullptr) : 0;
+        const int category = pikmin && get_pikmin_category ? get_pikmin_category(pikmin, nullptr) : 0;
+        const int box_type = get_deco_box_type ? get_deco_box_type(deco, nullptr) : 0;
+        return "gift:deco:pikmin:" + std::to_string(pikmin_type) + ":category:"
+                + std::to_string(category) + ":box:" + std::to_string(box_type);
+    }
+    void *rare_deco = get_gift_rare_deco ? get_gift_rare_deco(gift, nullptr) : nullptr;
+    if (rare_deco) {
+        const int category = get_rare_deco_category ? get_rare_deco_category(rare_deco, nullptr) : 0;
+        return "gift:rare:category:" + std::to_string(category);
+    }
+    return "gift:itemcase:" + std::to_string(item_case);
+}
+
 std::string describe_return_reward(void *task) {
     if (!task || !get_pikmin_task_proto) return "task-reward-unavailable";
     void *proto = get_pikmin_task_proto(task, nullptr);
@@ -379,7 +422,7 @@ std::string describe_return_reward(void *task) {
     void *carry = proto && get_task_carry ? get_task_carry(proto, nullptr) : nullptr;
     if (carry) {
         void *seed = get_carry_pikmin_seed ? get_carry_pikmin_seed(carry, nullptr) : nullptr;
-        if (seed && get_seed_type) return "carry:seed:" + std::to_string(get_seed_type(seed, nullptr));
+        if (seed) return "carry:" + describe_seed(seed);
         if (get_carry_resource && get_carry_resource(carry, nullptr)) return "carry:resource";
         return "carry:unknown";
     }
@@ -390,12 +433,18 @@ std::string describe_return_reward(void *task) {
         const int task_case = get_task_case ? get_task_case(proto, nullptr) : -1;
         return "taskcase:" + std::to_string(task_case) + ":unparsed";
     }
+    if (get_expedition_seed) {
+        void *seed = get_expedition_seed(expedition, nullptr);
+        if (seed) return "expedition:" + describe_seed(seed);
+    }
     if (get_expedition_fruit) {
         void *fruit = get_expedition_fruit(expedition, nullptr);
         if (fruit) return "expedition:fruit:" + describe_resource(fruit);
     }
-    if (get_expedition_gift && get_expedition_gift(expedition, nullptr))
-        return "expedition:gift:reward-not-in-task-proto";
+    if (get_expedition_gift) {
+        void *gift = get_expedition_gift(expedition, nullptr);
+        if (gift) return "expedition:" + describe_gift(gift);
+    }
     if (get_expedition_postcard && get_expedition_postcard(expedition, nullptr))
         return "expedition:postcard";
     if (get_expedition_postcard_with_items && get_expedition_postcard_with_items(expedition, nullptr))
@@ -613,10 +662,10 @@ void log_task_variant_metadata(void *proto) {
         LOGI("[RETURN-META] active task variant=%s class=%s", labels[index], name ? name : "unknown");
         log_class_methods(labels[index], klass);
         if (index == 1) {
-            const GetTaskVariant getters[] = {get_expedition_fruit, get_expedition_gift,
+            const GetTaskVariant getters[] = {get_expedition_seed, get_expedition_fruit, get_expedition_gift,
                     get_expedition_bloomed_poi, get_expedition_postcard, get_expedition_postcard_with_items};
-            const char *target_labels[] = {"Fruit", "ExpeditionGift", "BloomedPoi", "Postcard", "PostcardWithItems"};
-            for (int target = 0; target < 5; ++target) {
+            const char *target_labels[] = {"Seed", "Fruit", "ExpeditionGift", "BloomedPoi", "Postcard", "PostcardWithItems"};
+            for (int target = 0; target < 6; ++target) {
                 if (!getters[target] || return_expedition_target_metadata_logged[target]) continue;
                 void *value = getters[target](variant, nullptr);
                 if (!value) continue;
@@ -625,7 +674,7 @@ void log_task_variant_metadata(void *proto) {
                 LOGI("[RETURN-META] active expedition target=%s class=%s", target_labels[target],
                      value_name ? value_name : "unknown");
                 log_class_methods(target_labels[target], value_class);
-                if (target == 2 && get_bloomed_poi_reward_v2 && !return_bloomed_poi_reward_metadata_logged) {
+                if (target == 3 && get_bloomed_poi_reward_v2 && !return_bloomed_poi_reward_metadata_logged) {
                     void *reward = get_bloomed_poi_reward_v2(value, nullptr);
                     if (reward) {
                         void *reward_class = object_get_class(reward);
@@ -769,19 +818,41 @@ void install_return_diagnostic_hook() {
     get_carry_pikmin_seed = carry_seed ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(carry_seed)) : nullptr;
     void *seed_class = find_class("Ichigo.Proto", "PikminSeedProto");
     void *seed_type = seed_class ? class_get_method_from_name(seed_class, "get_SeedType", 0) : nullptr;
+    void *seed_pikmin = seed_class ? class_get_method_from_name(seed_class, "get_Pikmin", 0) : nullptr;
     get_seed_type = seed_type ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(seed_type)) : nullptr;
+    get_seed_pikmin = seed_pikmin ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(seed_pikmin)) : nullptr;
     void *expedition_class = find_class("Ichigo.Proto", "ExpeditionTaskProto");
     void *expedition_target_case = expedition_class
             ? class_get_method_from_name(expedition_class, "get_TargetCase", 0) : nullptr;
     get_expedition_target_case = expedition_target_case
             ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(expedition_target_case)) : nullptr;
-    const char *target_getters[] = {"get_Fruit", "get_Gift", "get_BloomedPoi", "get_Postcard", "get_PostcardWithItems"};
-    GetTaskVariant *target_functions[] = {&get_expedition_fruit, &get_expedition_gift,
+    const char *target_getters[] = {"get_Seed", "get_Fruit", "get_Gift", "get_BloomedPoi", "get_Postcard", "get_PostcardWithItems"};
+    GetTaskVariant *target_functions[] = {&get_expedition_seed, &get_expedition_fruit, &get_expedition_gift,
             &get_expedition_bloomed_poi, &get_expedition_postcard, &get_expedition_postcard_with_items};
-    for (int index = 0; index < 5; ++index) {
+    for (int index = 0; index < 6; ++index) {
         void *method = expedition_class ? class_get_method_from_name(expedition_class, target_getters[index], 0) : nullptr;
         *target_functions[index] = method ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(method)) : nullptr;
     }
+    void *pikmin_type_class = find_class("Ichigo.Proto", "PikminTypeProto");
+    void *pikmin_type = pikmin_type_class ? class_get_method_from_name(pikmin_type_class, "get_Type", 0) : nullptr;
+    void *pikmin_category = pikmin_type_class ? class_get_method_from_name(pikmin_type_class, "get_CategoryId", 0) : nullptr;
+    get_pikmin_type = pikmin_type ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(pikmin_type)) : nullptr;
+    get_pikmin_category = pikmin_category ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(pikmin_category)) : nullptr;
+    void *gift_class = find_class("Ichigo.Proto", "PikminGiftProto");
+    void *gift_item_case = gift_class ? class_get_method_from_name(gift_class, "get_ItemCase", 0) : nullptr;
+    void *gift_deco = gift_class ? class_get_method_from_name(gift_class, "get_Deco", 0) : nullptr;
+    void *gift_rare_deco = gift_class ? class_get_method_from_name(gift_class, "get_RareDeco", 0) : nullptr;
+    get_gift_item_case = gift_item_case ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(gift_item_case)) : nullptr;
+    get_gift_deco = gift_deco ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(gift_deco)) : nullptr;
+    get_gift_rare_deco = gift_rare_deco ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(gift_rare_deco)) : nullptr;
+    void *deco_class = find_class("Ichigo.Proto", "PikminDecorationProto");
+    void *deco_pikmin_type = deco_class ? class_get_method_from_name(deco_class, "get_PikminType", 0) : nullptr;
+    void *deco_box_type = deco_class ? class_get_method_from_name(deco_class, "get_BoxType", 0) : nullptr;
+    get_deco_pikmin_type = deco_pikmin_type ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(deco_pikmin_type)) : nullptr;
+    get_deco_box_type = deco_box_type ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(deco_box_type)) : nullptr;
+    void *rare_deco_class = find_class("Ichigo.Proto", "PikminRareDecorationProto");
+    void *rare_deco_category = rare_deco_class ? class_get_method_from_name(rare_deco_class, "get_CategoryId", 0) : nullptr;
+    get_rare_deco_category = rare_deco_category ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(rare_deco_category)) : nullptr;
     void *resource_class = find_class("Ichigo.Proto", "ResourceProto");
     void *resource_type = resource_class ? class_get_method_from_name(resource_class, "get_Type", 0) : nullptr;
     void *resource_pikmins = resource_class ? class_get_method_from_name(resource_class, "get_NumPikmins", 0) : nullptr;
