@@ -166,6 +166,11 @@ GetTaskInt get_resource_num_pikmins{};
 GetTaskInt get_resource_honey_flower_kind{};
 GetTaskInt get_resource_weight_grams{};
 GetTaskVariant get_resource_flower_kind{};
+GetTaskVariant get_resource_honey_balls{};
+GetTaskInt get_honey_num_balls{};
+GetTaskInt get_honey_type{};
+GetTaskInt get_honey_flower_kind{};
+GetTaskVariant get_honey_flower_kind_text{};
 PikminTaskPreparerConstructor original_pikmin_task_preparer_constructor{};
 PikminTaskActionManagerConstructor original_pikmin_task_action_manager_constructor{};
 TaskBool task_is_completed{};
@@ -305,6 +310,47 @@ const char *flower_kind_name(int kind) {
     }
 }
 
+const char *honey_type_name(int type) {
+    switch (type) {
+        case 1: return "white";
+        case 2: return "red";
+        case 3: return "blue";
+        case 4: return "yellow";
+        case 5: return "happy";
+        default: return "unknown";
+    }
+}
+
+// ResourceProto.WeightGrams is task weight, not the awarded nectar amount.
+// The actual reward is the repeated HoneyBallProto.NumBalls payload.
+std::string describe_resource_honey(void *resource) {
+    if (!resource || !get_resource_honey_balls || !get_honey_num_balls || !get_honey_type)
+        return {};
+    void *repeated = get_resource_honey_balls(resource, nullptr);
+    if (!repeated) return {};
+    auto *repeated_bytes = static_cast<uint8_t *>(repeated);
+    void *items = *reinterpret_cast<void **>(repeated_bytes + 0x10);
+    const int count = *reinterpret_cast<int *>(repeated_bytes + 0x18);
+    if (!items || count < 1 || count > 16) return {};
+    std::string result;
+    for (int index = 0; index < count; ++index) {
+        void *honey = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
+        if (!honey) continue;
+        std::string flower = get_honey_flower_kind_text
+                ? utf8_string(get_honey_flower_kind_text(honey, nullptr)) : "";
+        if (flower.empty() && get_honey_flower_kind) {
+            const int kind = get_honey_flower_kind(honey, nullptr);
+            if (kind > 0) flower = flower_kind_name(kind);
+        }
+        if (flower.empty()) flower = "unknown-flower";
+        if (!result.empty()) result += ";";
+        result += flower;
+        result += ":" + std::string(honey_type_name(get_honey_type(honey, nullptr)));
+        result += ":" + std::to_string(get_honey_num_balls(honey, nullptr));
+    }
+    return result;
+}
+
 // All reward attributes below are read through v151 public protobuf getters.
 // This avoids relying on private object offsets for the direct Fruit target.
 std::string describe_resource(void *resource) {
@@ -312,7 +358,6 @@ std::string describe_resource(void *resource) {
         return "unknown-fruit";
     const int type = get_resource_type(resource, nullptr);
     const int pikmins = get_resource_num_pikmins(resource, nullptr);
-    const int grams = get_resource_weight_grams(resource, nullptr);
     std::string flower = get_resource_flower_kind
             ? utf8_string(get_resource_flower_kind(resource, nullptr)) : "";
     if (flower.empty() && get_resource_honey_flower_kind) {
@@ -320,8 +365,9 @@ std::string describe_resource(void *resource) {
         if (kind > 0) flower = flower_kind_name(kind);
     }
     std::string result = std::string(fruit_type_name(type)) + " x" + std::to_string(pikmins);
-    if (!flower.empty()) result += " flower=" + flower;
-    if (grams > 0) result += " " + std::to_string(grams) + "g";
+    const std::string honey = describe_resource_honey(resource);
+    if (!honey.empty()) result += " honey=" + honey;
+    else if (!flower.empty()) result += " flower=" + flower;
     return result;
 }
 
@@ -742,11 +788,22 @@ void install_return_diagnostic_hook() {
     void *resource_flower = resource_class ? class_get_method_from_name(resource_class, "get_FlowerKind", 0) : nullptr;
     void *resource_honey_flower = resource_class ? class_get_method_from_name(resource_class, "get_HoneyBallFlowerKind", 0) : nullptr;
     void *resource_weight = resource_class ? class_get_method_from_name(resource_class, "get_WeightGrams", 0) : nullptr;
+    void *resource_honey_balls = resource_class ? class_get_method_from_name(resource_class, "get_HoneyBall", 0) : nullptr;
     get_resource_type = resource_type ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(resource_type)) : nullptr;
     get_resource_num_pikmins = resource_pikmins ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(resource_pikmins)) : nullptr;
     get_resource_flower_kind = resource_flower ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(resource_flower)) : nullptr;
     get_resource_honey_flower_kind = resource_honey_flower ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(resource_honey_flower)) : nullptr;
     get_resource_weight_grams = resource_weight ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(resource_weight)) : nullptr;
+    get_resource_honey_balls = resource_honey_balls ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(resource_honey_balls)) : nullptr;
+    void *honey_class = find_class("Ichigo.Proto", "HoneyBallProto");
+    void *honey_num_balls = honey_class ? class_get_method_from_name(honey_class, "get_NumBalls", 0) : nullptr;
+    void *honey_type = honey_class ? class_get_method_from_name(honey_class, "get_HoneyType", 0) : nullptr;
+    void *honey_flower_kind = honey_class ? class_get_method_from_name(honey_class, "get_HoneyFlowerKind", 0) : nullptr;
+    void *honey_flower_text = honey_class ? class_get_method_from_name(honey_class, "get_FlowerKind", 0) : nullptr;
+    get_honey_num_balls = honey_num_balls ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(honey_num_balls)) : nullptr;
+    get_honey_type = honey_type ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(honey_type)) : nullptr;
+    get_honey_flower_kind = honey_flower_kind ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(honey_flower_kind)) : nullptr;
+    get_honey_flower_kind_text = honey_flower_text ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(honey_flower_text)) : nullptr;
     void *bloomed_poi_class = find_class("Ichigo.Proto", "PoiFlowerBloomedRewardProto");
     void *reward_v2 = bloomed_poi_class
             ? class_get_method_from_name(bloomed_poi_class, "get_RewardV2", 0) : nullptr;
