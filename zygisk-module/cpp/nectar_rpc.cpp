@@ -1166,7 +1166,9 @@ void maybe_claim() {
         if (flower.attempted || flower.received || flower.state != 3) continue;
         if (flower.wilting_ms > 0 && flower.wilting_ms <= current) continue;
         const double distance = distance_metres(player_lat, player_lng, flower.latitude, flower.longitude);
-        if (distance > 100.0) continue;
+        // GPS updates and map-object positions can differ by a few metres.
+        // Permit a bounded tolerance above the nominal 100 m collection radius.
+        if (distance > 120.0) continue;
         if (!resolve_request_class() || !object_new || !string_new || !request_constructor ||
             !request_set_map_object_id || !request_set_include_failure || !send_claim) return;
         void *request = object_new(request_class);
