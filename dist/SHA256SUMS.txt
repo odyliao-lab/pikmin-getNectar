@@ -1,3 +1,4 @@
 2b62e137a28e1006f60ea6c99b6e49ae34ee6ea75af2c3a1379927afc3a627fe  pikmin-nectar-control.apk
 5edcb48db7012bf364db64348ab46dad6a80376178d05a381a80ff9f6f5ff467  pikmin-nectar-rpc-v150.zip
 2973154f17e0be1de370954e8e882a3ef41d155c219bbaf4f2e5afc6ae44874e  pikmin-nectar-rpc-v151.zip
+14afff0715f43a1373315874b4eb28cc962d308330de522e5644fdae23e47df9  pikmin-nectar-rpc-v152.zip

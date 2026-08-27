@@ -27,7 +27,7 @@ New-Item -ItemType Directory -Force -Path $zygisk | Out-Null
 Copy-Item -LiteralPath (Join-Path $build 'libpikmin_nectar_rpc.so') `
     -Destination (Join-Path $zygisk 'arm64-v8a.so') -Force
 
-$zip = Join-Path $root 'pikmin-nectar-rpc-v151.zip'
+$zip = Join-Path $root 'pikmin-nectar-rpc-v152.zip'
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
 # Magisk/Kitsune requires POSIX-style entry names (zygisk/arm64-v8a.so).
 # Windows tar.exe uses an archive dialect its installer rejects, while

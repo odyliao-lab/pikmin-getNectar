@@ -21,24 +21,24 @@
 
 namespace {
 
-// Pikmin Bloom 151.0 / arm64-v8a. Regenerated from the installed APK's
+// Pikmin Bloom 152.0 / arm64-v8a. Regenerated from the installed APK's
 // libil2cpp.so plus global-metadata.dat; nonmatching binaries fail closed.
-constexpr off_t kExpectedIl2CppSize = 254191320;
-constexpr uintptr_t kRegisterMapObjectRva = 0x59E4ADC;
-constexpr uintptr_t kMapObjectManagerUpdateRva = 0x59E67D0;
-constexpr uintptr_t kFlowerModelUpdatedRva = 0x59F79E4;
-constexpr uintptr_t kRpcManagerConstructorRva = 0x721BE8C;
-constexpr uintptr_t kRpcManagerLoggedInRva = 0x721B788;
-constexpr uintptr_t kPlantingInitRva = 0x5EE1E44;
-constexpr uintptr_t kPlantingStartRva = 0x5EE1FB8;
-constexpr uintptr_t kPlantingStateUpdatedRva = 0x5EE27F4;
-constexpr uintptr_t kLocationControllerAwakeRva = 0x71576D8;
-constexpr uintptr_t kRequestConstructorRva = 0x71D2DE8;
-constexpr uintptr_t kRequestSetMapObjectIdRva = 0x71D2FE0;
-constexpr uintptr_t kRequestSetIncludeFailureRva = 0x71D30C0;
-constexpr uintptr_t kSendClaimRva = 0x720AF0C;
-constexpr uintptr_t kTaskIsCompletedRva = 0xC8EEDAC;
-constexpr uintptr_t kTaskIsFaultedRva = 0xC8F47C0;
+constexpr off_t kExpectedIl2CppSize = 254505288;
+constexpr uintptr_t kRegisterMapObjectRva = 0x5A50188;
+constexpr uintptr_t kMapObjectManagerUpdateRva = 0x5A51E7C;
+constexpr uintptr_t kFlowerModelUpdatedRva = 0x5A6309C;
+constexpr uintptr_t kRpcManagerConstructorRva = 0x727B96C;
+constexpr uintptr_t kRpcManagerLoggedInRva = 0x727B25C;
+constexpr uintptr_t kPlantingInitRva = 0x5F2A650;
+constexpr uintptr_t kPlantingStartRva = 0x5F2A7C4;
+constexpr uintptr_t kPlantingStateUpdatedRva = 0x5F2B000;
+constexpr uintptr_t kLocationControllerAwakeRva = 0x71B4B90;
+constexpr uintptr_t kRequestConstructorRva = 0x72181C8;
+constexpr uintptr_t kRequestSetMapObjectIdRva = 0x72183C0;
+constexpr uintptr_t kRequestSetIncludeFailureRva = 0x72184A0;
+constexpr uintptr_t kSendClaimRva = 0x726A6D0;
+constexpr uintptr_t kTaskIsCompletedRva = 0xC934858;
+constexpr uintptr_t kTaskIsFaultedRva = 0xC93A26C;
 
 constexpr size_t kInitialMapObjectProtoOffset = 0x68;
 constexpr size_t kInteractionSettingsOffset = 0xA8;
@@ -491,7 +491,7 @@ void write_return_status(const char *event, int task_count, int completed, bool 
 void write_compatibility_status(bool compatible, off_t observed_size) {
     FILE *file = std::fopen(compatibility_path, "w");
     if (!file) return;
-    std::fprintf(file, "v151\t%s\t%lld\t%lld\n", compatible ? "compatible" : "incompatible",
+    std::fprintf(file, "v152\t%s\t%lld\t%lld\n", compatible ? "compatible" : "incompatible",
                  static_cast<long long>(kExpectedIl2CppSize), static_cast<long long>(observed_size));
     std::fclose(file);
     chmod(compatibility_path, 0644);
@@ -1270,7 +1270,7 @@ void hooked_update_proto_object(void *self, void *proto, void *method_info) {
 void hooked_flower_model_updated(void *self, void *method_info) {
     if (original_flower_model_updated) original_flower_model_updated(self, method_info);
     log_flower(self);
-    // v151 registers live flowers without consistently calling the manager's
+    // v152 registers live flowers without consistently calling the manager's
     // Update method.  Run the same mode-gated heartbeat here so diagnostic
     // status and opt-in automation both see those observations.
     maybe_claim();
@@ -1527,10 +1527,13 @@ void start(const char *game_data_dir) {
     std::snprintf(system_gps_path, sizeof(system_gps_path), "%s/files/nectar_system_gps.tsv", game_data_dir);
     std::snprintf(return_trace_path, sizeof(return_trace_path), "%s/files/return_rpc_trace.tsv", game_data_dir);
     std::snprintf(return_history_path, sizeof(return_history_path), "%s/files/return_reward_history.tsv", game_data_dir);
-    std::snprintf(return_mode_path, sizeof(return_mode_path), "%s/files/return_rpc_mode.txt", game_data_dir);
-    std::snprintf(return_postcard_policy_path, sizeof(return_postcard_policy_path), "%s/files/return_postcard_policy.txt", game_data_dir);
+    // These paths are shared with the root-protected Control Center.  Keeping
+    // the native reader and controller writer identical prevents a UI setting
+    // from silently remaining in dry-run mode.
+    std::snprintf(return_mode_path, sizeof(return_mode_path), "/data/local/tmp/pikmin-return-mode.txt");
+    std::snprintf(return_postcard_policy_path, sizeof(return_postcard_policy_path), "/data/local/tmp/pikmin-return-postcard-policy.txt");
     std::snprintf(return_status_path, sizeof(return_status_path), "%s/files/return_rpc_status.tsv", game_data_dir);
-    std::snprintf(return_batch_limit_path, sizeof(return_batch_limit_path), "%s/files/return_batch_limit.txt", game_data_dir);
+    std::snprintf(return_batch_limit_path, sizeof(return_batch_limit_path), "/data/local/tmp/pikmin-return-batch-limit.txt");
     std::snprintf(compatibility_path, sizeof(compatibility_path), "%s/files/compatibility_status.tsv", game_data_dir);
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
@@ -1557,7 +1560,7 @@ void start(const char *game_data_dir) {
     install_hook(base, kPlantingStateUpdatedRva, reinterpret_cast<void *>(hooked_planting_state_updated), original_planting_state_updated);
     install_hook(base, kLocationControllerAwakeRva, reinterpret_cast<void *>(hooked_location_controller_awake), original_location_controller_awake);
     install_return_diagnostic_hook();
-    LOGI("[NECTAR] v151 RPC hooks installed base=%" PRIxPTR " mode=%s", base, mode_path);
+    LOGI("[NECTAR] v152 RPC hooks installed base=%" PRIxPTR " mode=%s", base, mode_path);
 }
 
 }  // namespace
