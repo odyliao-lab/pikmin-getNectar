@@ -163,6 +163,7 @@ GetTaskInt get_seed_type{};
 GetTaskVariant get_seed_pikmin{};
 GetTaskInt get_pikmin_type{};
 GetTaskInt get_pikmin_category{};
+GetTaskInt get_pikmin_full_asset{};
 GetTaskInt get_gift_item_case{};
 GetTaskVariant get_gift_deco{};
 GetTaskVariant get_gift_rare_deco{};
@@ -390,8 +391,9 @@ std::string describe_seed(void *seed) {
     void *pikmin = get_seed_pikmin ? get_seed_pikmin(seed, nullptr) : nullptr;
     const int pikmin_type = pikmin && get_pikmin_type ? get_pikmin_type(pikmin, nullptr) : 0;
     const int category = pikmin && get_pikmin_category ? get_pikmin_category(pikmin, nullptr) : 0;
+    const int asset = pikmin && get_pikmin_full_asset ? get_pikmin_full_asset(pikmin, nullptr) : 0;
     return "seed:" + std::to_string(seed_type) + ":pikmin:" + std::to_string(pikmin_type)
-            + ":category:" + std::to_string(category);
+            + ":category:" + std::to_string(category) + ":asset:" + std::to_string(asset);
 }
 
 std::string describe_gift(void *gift) {
@@ -836,8 +838,10 @@ void install_return_diagnostic_hook() {
     void *pikmin_type_class = find_class("Ichigo.Proto", "PikminTypeProto");
     void *pikmin_type = pikmin_type_class ? class_get_method_from_name(pikmin_type_class, "get_Type", 0) : nullptr;
     void *pikmin_category = pikmin_type_class ? class_get_method_from_name(pikmin_type_class, "get_CategoryId", 0) : nullptr;
+    void *pikmin_full_asset = pikmin_type_class ? class_get_method_from_name(pikmin_type_class, "get_FullAssetId", 0) : nullptr;
     get_pikmin_type = pikmin_type ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(pikmin_type)) : nullptr;
     get_pikmin_category = pikmin_category ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(pikmin_category)) : nullptr;
+    get_pikmin_full_asset = pikmin_full_asset ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(pikmin_full_asset)) : nullptr;
     void *gift_class = find_class("Ichigo.Proto", "PikminGiftProto");
     void *gift_item_case = gift_class ? class_get_method_from_name(gift_class, "get_ItemCase", 0) : nullptr;
     void *gift_deco = gift_class ? class_get_method_from_name(gift_class, "get_Deco", 0) : nullptr;
