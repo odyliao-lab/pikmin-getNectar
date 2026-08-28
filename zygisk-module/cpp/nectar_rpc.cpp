@@ -93,6 +93,9 @@ using GetTaskDouble = double (*)(void *, void *);
 using GetTaskVariant = void *(*)(void *, void *);
 using GetTaskInt = int (*)(void *, void *);
 using GetExpeditionDurationMs = int64_t (*)(void *, void *);
+using GetExpeditionDataByIndex = void *(*)(void *, int, void *, void *);
+using GetExpeditionBool = bool (*)(void *, void *);
+using ExpeditionDataStoreConstructor = void (*)(void *, void *);
 using PikminTaskPreparerConstructor = void (*)(void *, void *, void *, void *, void *);
 using PikminTaskActionManagerConstructor = void (*)(void *, void *);
 
@@ -191,6 +194,9 @@ GetTaskInt get_honey_flower_kind{};
 GetTaskVariant get_honey_flower_kind_text{};
 GetTaskVariant get_expedition_item_key{};
 GetExpeditionDurationMs original_get_expedition_total_duration_ms{};
+GetExpeditionDataByIndex get_expedition_data_by_index{};
+GetExpeditionBool get_expedition_can_try_start{};
+ExpeditionDataStoreConstructor original_expedition_data_store_constructor{};
 PikminTaskPreparerConstructor original_pikmin_task_preparer_constructor{};
 PikminTaskActionManagerConstructor original_pikmin_task_action_manager_constructor{};
 TaskBool task_is_completed{};
@@ -205,6 +211,7 @@ void *location_controller{};
 void *return_preparer{};
 void *return_inventory_manager{};
 void *return_action_manager{};
+void *expedition_data_store{};
 char flower_log_path[512]{};
 char mode_path[512]{};
 char target_path[512]{};
@@ -220,6 +227,7 @@ char return_batch_limit_path[512]{};
 char compatibility_path[512]{};
 char dispatch_candidates_path[512]{};
 char dispatch_status_path[512]{};
+char dispatch_mode_path[512]{};
 std::string observed_expedition_task_id;
 int64_t observed_expedition_duration_ms{};
 std::map<std::string, FlowerRecord> flowers;
@@ -547,11 +555,17 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         const double longitude = point && get_point_lng_degrees ? get_point_lng_degrees(point, nullptr) : 0.0;
         const double distance = has_current_location && (latitude != 0.0 || longitude != 0.0)
                 ? distance_metres(current_latitude, current_longitude, latitude, longitude) : -1.0;
-        const int64_t game_duration = utf8_string(id) == observed_expedition_task_id
-                ? observed_expedition_duration_ms : 0;
-        std::fprintf(file, "%lld\t%s\t%s\t0\t%" PRId64 "\t%.7f\t%.7f\tpending-travel-estimate\t%.1f\t%" PRId64 "\n", observed_ms,
-                     target_case == 9 ? "seed" : "fruit", utf8_string(id).c_str(),
-                     expiration_ms, latitude, longitude, distance, game_duration);
+        const std::string id_text = utf8_string(id);
+        void *data = expedition_data_store && get_expedition_data_by_index
+                ? get_expedition_data_by_index(expedition_data_store, 0, id, nullptr) : nullptr;
+        int64_t game_duration = data && original_get_expedition_total_duration_ms
+                ? original_get_expedition_total_duration_ms(data, nullptr) : 0;
+        const bool can_start = data && get_expedition_can_try_start
+                ? get_expedition_can_try_start(data, nullptr) : false;
+        if (game_duration <= 0 && id_text == observed_expedition_task_id) game_duration = observed_expedition_duration_ms;
+        std::fprintf(file, "%lld\t%s\t%s\t0\t%" PRId64 "\t%.7f\t%.7f\tpending-travel-estimate\t%.1f\t%" PRId64 "\t%d\n", observed_ms,
+                     target_case == 9 ? "seed" : "fruit", id_text.c_str(),
+                     expiration_ms, latitude, longitude, distance, game_duration, can_start ? 1 : 0);
         ++candidates;
     }
     std::fclose(file);
@@ -644,6 +658,17 @@ void hooked_pikmin_task_action_manager_constructor(void *self, void *method_info
     }
     return_action_manager = self;
     LOGI("[RETURN-DIAG] action manager captured self=%p", self);
+}
+
+// The store owns every live expedition data item, including entries whose UI
+// page has never been opened.  Capturing it lets the background scanner use
+// the game's own data object for each inventory task.
+void hooked_expedition_data_store_constructor(void *self, void *method_info) {
+    if (original_expedition_data_store_constructor) {
+        original_expedition_data_store_constructor(self, method_info);
+    }
+    expedition_data_store = self;
+    LOGI("[DISPATCH-OBSERVE] expedition data store captured self=%p", self);
 }
 
 // The picker evaluates this after selecting its fastest valid Pikmin.  By
@@ -905,6 +930,28 @@ void install_return_diagnostic_hook() {
              expedition_duration_method, expedition_duration_entry);
     } else {
         LOGE("[DISPATCH-OBSERVE] ExpeditionItemData.TotalDurationMs not found");
+    }
+    void *expedition_store_class = find_class("Niantic.Ichigo.Game.Expedition.Data", "ExpeditionDataStore");
+    void *expedition_store_ctor = expedition_store_class
+            ? class_get_method_from_name(expedition_store_class, ".ctor", 0) : nullptr;
+    void *expedition_store_ctor_entry = expedition_store_ctor
+            ? *reinterpret_cast<void **>(expedition_store_ctor) : nullptr;
+    void *by_index_method = expedition_store_class
+            ? class_get_method_from_name(expedition_store_class, "ByIndex", 2) : nullptr;
+    get_expedition_data_by_index = by_index_method
+            ? reinterpret_cast<GetExpeditionDataByIndex>(*reinterpret_cast<void **>(by_index_method)) : nullptr;
+    void *can_start_method = expedition_item_class
+            ? class_get_method_from_name(expedition_item_class, "get_CanTryStart", 0) : nullptr;
+    get_expedition_can_try_start = can_start_method
+            ? reinterpret_cast<GetExpeditionBool>(*reinterpret_cast<void **>(can_start_method)) : nullptr;
+    if (expedition_store_ctor_entry) {
+        A64HookFunction(expedition_store_ctor_entry,
+                        reinterpret_cast<void *>(hooked_expedition_data_store_constructor),
+                        reinterpret_cast<void **>(&original_expedition_data_store_constructor));
+        LOGI("[DISPATCH-OBSERVE] store hook installed ctor=%p byIndex=%p canTryStart=%p",
+             expedition_store_ctor_entry, by_index_method, can_start_method);
+    } else {
+        LOGE("[DISPATCH-OBSERVE] ExpeditionDataStore constructor not found");
     }
     void *task_case = proto_class ? class_get_method_from_name(proto_class, "get_TaskCase", 0) : nullptr;
     get_task_case = task_case ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(task_case)) : nullptr;
@@ -1439,6 +1486,17 @@ std::string read_return_mode() {
     return result.empty() ? "dry-run" : result;
 }
 
+// Dispatch remains fail-closed until the control centre explicitly writes
+// "armed".  The current development stage only publishes this state.
+std::string read_dispatch_mode() {
+    FILE *file = std::fopen(dispatch_mode_path, "r");
+    if (!file) return "off";
+    char value[16]{};
+    std::fgets(value, sizeof(value), file);
+    std::fclose(file);
+    return std::strncmp(value, "armed", 5) == 0 ? "armed" : "off";
+}
+
 // The policy defaults to preserving postcards. Only the explicit "discard"
 // value changes the boolean passed to the game's native completion API.
 bool return_discard_postcard() {
@@ -1673,6 +1731,7 @@ void start(const char *game_data_dir) {
     std::snprintf(compatibility_path, sizeof(compatibility_path), "%s/files/compatibility_status.tsv", game_data_dir);
     std::snprintf(dispatch_candidates_path, sizeof(dispatch_candidates_path), "%s/files/dispatch_candidates.tsv", game_data_dir);
     std::snprintf(dispatch_status_path, sizeof(dispatch_status_path), "%s/files/dispatch_probe_status.tsv", game_data_dir);
+    std::snprintf(dispatch_mode_path, sizeof(dispatch_mode_path), "/data/local/tmp/pikmin-dispatch-mode.txt");
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);
