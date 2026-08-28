@@ -275,6 +275,7 @@ double pending_distance{};
 std::string last_result = "none";
 
 long long now_ms();
+void *find_class(const char *namespaze, const char *name);
 void log_task_variant_metadata(void *proto);
 bool current_location(double &latitude, double &longitude);
 double distance_metres(double lat1, double lng1, double lat2, double lng2);
