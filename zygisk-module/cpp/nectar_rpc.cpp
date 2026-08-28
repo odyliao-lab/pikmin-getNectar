@@ -253,6 +253,8 @@ std::string last_result = "none";
 
 long long now_ms();
 void log_task_variant_metadata(void *proto);
+bool current_location(double &latitude, double &longitude);
+double distance_metres(double lat1, double lng1, double lat2, double lng2);
 
 std::string utf8_string(void *value) {
     if (!value) return {};
@@ -521,6 +523,8 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     if (!items || count < 0 || count > 128) return;
     FILE *file = std::fopen(dispatch_candidates_path, "w");
     if (!file) return;
+    double current_latitude{}, current_longitude{};
+    const bool has_current_location = current_location(current_latitude, current_longitude);
     int candidates{};
     for (int index = 0; index < count; ++index) {
         void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
@@ -535,9 +539,11 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         void *point = get_expedition_spawn_point ? get_expedition_spawn_point(expedition, nullptr) : nullptr;
         const double latitude = point && get_point_lat_degrees ? get_point_lat_degrees(point, nullptr) : 0.0;
         const double longitude = point && get_point_lng_degrees ? get_point_lng_degrees(point, nullptr) : 0.0;
-        std::fprintf(file, "%lld\t%s\t%s\t0\t%" PRId64 "\t%.7f\t%.7f\tpending-travel-estimate\n", observed_ms,
+        const double distance = has_current_location && (latitude != 0.0 || longitude != 0.0)
+                ? distance_metres(current_latitude, current_longitude, latitude, longitude) : -1.0;
+        std::fprintf(file, "%lld\t%s\t%s\t0\t%" PRId64 "\t%.7f\t%.7f\tpending-travel-estimate\t%.1f\n", observed_ms,
                      target_case == 9 ? "seed" : "fruit", utf8_string(id).c_str(),
-                     expiration_ms, latitude, longitude);
+                     expiration_ms, latitude, longitude, distance);
         ++candidates;
     }
     std::fclose(file);
