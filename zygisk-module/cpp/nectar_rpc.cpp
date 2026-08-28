@@ -263,6 +263,7 @@ bool return_expedition_target_metadata_logged[6]{};
 bool return_bloomed_poi_reward_metadata_logged{};
 bool return_bloomed_poi_fruit_metadata_logged{};
 bool return_bloomed_poi_fruit_entry_metadata_logged{};
+bool dispatch_enumerable_metadata_logged{};
 void *pending_task{};
 uint32_t pending_task_handle{};
 std::string pending_id;
@@ -553,6 +554,20 @@ int count_enumerable_items(void *enumerable) {
     return count;
 }
 
+void log_dispatch_enumerable_metadata(void *object, const char *label) {
+    if (!object || !object_get_class || !class_get_methods || !method_get_name || dispatch_enumerable_metadata_logged) return;
+    dispatch_enumerable_metadata_logged = true;
+    void *klass = object_get_class(object);
+    LOGI("[DISPATCH-META] %s object=%p class=%s", label, object,
+         klass && class_get_name ? class_get_name(klass) : "?");
+    void *iter{};
+    for (int count{}; klass && count < 80 && (iter = class_get_methods(klass, &iter)); ++count) {
+        const char *name = method_get_name(iter);
+        LOGI("[DISPATCH-META] method=%s params=%u", name ? name : "?",
+             method_get_param_count ? method_get_param_count(iter) : 0);
+    }
+}
+
 void write_dispatch_candidates(void *list, long long observed_ms) {
     if (!list || !get_pikmin_task_proto || !get_task_finish_time_ms ||
         !get_task_expedition || !get_expedition_target_case) return;
@@ -594,6 +609,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 ? get_pikmin_item_collection(return_inventory_manager, nullptr) : nullptr;
         void *picked = utils && pick_fastest_pikmins && pikmins && scope
                 ? pick_fastest_pikmins(utils, data, pikmins, scope, nullptr) : nullptr;
+        log_dispatch_enumerable_metadata(picked ? picked : pikmins, picked ? "picked" : "pikminCollection");
         const int picked_count = count_enumerable_items(picked);
         std::fprintf(file, "%lld\t%s\t%s\t0\t%" PRId64 "\t%.7f\t%.7f\tpending-travel-estimate\t%.1f\t%" PRId64 "\t%d\t%d\n", observed_ms,
                      target_case == 9 ? "seed" : "fruit", id_text.c_str(),
