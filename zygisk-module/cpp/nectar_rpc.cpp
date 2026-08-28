@@ -1306,6 +1306,10 @@ void hooked_rpc_manager_logged_in(void *self, void *server_url, void *player_id,
 }
 void hooked_register_map_object(void *self, void *map_object, int tag, void *method_info) {
     if (original_register_map_object) original_register_map_object(self, map_object, tag, method_info);
+    // Map objects are registered only after the live game world is active.
+    // This is a reliable safe point when the earlier login callback occurred
+    // before our direct hooks had been installed.
+    initialize_runtime_metadata();
     log_flower(map_object);
     maybe_claim();
 }
