@@ -14,6 +14,5 @@ add_library(pikmin_nectar_rpc SHARED
     "${SUPPORT_DIR}/main.cpp"
     "${SUPPORT_DIR}/And64InlineHook.cpp"
     nectar_rpc.cpp
-    gps_copy.cpp
     ${XDL_SOURCES})
 target_link_libraries(pikmin_nectar_rpc log dl)
