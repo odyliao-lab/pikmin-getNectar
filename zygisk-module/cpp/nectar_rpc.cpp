@@ -882,7 +882,7 @@ void install_return_diagnostic_hook() {
     }
     get_pikmin_task_proto = reinterpret_cast<GetPikminTaskProto>(proto_entry);
     get_task_finish_time_ms = reinterpret_cast<GetTaskFinishTimeMs>(finish_entry);
-    void *expedition_item_class = find_class("Niantic.Ichigo.Game.Expedition", "ExpeditionItemData");
+    void *expedition_item_class = find_class("Niantic.Ichigo.Game.Expedition.Data", "ExpeditionItemData");
     void *expedition_key_method = expedition_item_class
             ? class_get_method_from_name(expedition_item_class, "get_Key", 0) : nullptr;
     void *expedition_duration_method = expedition_item_class
