@@ -8,3 +8,4 @@ zygisk-module/module/zygisk/*.so
 zygisk-module/*.zip
 *.log
 *.tsv
+tmp/
