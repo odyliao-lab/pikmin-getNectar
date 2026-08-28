@@ -187,6 +187,7 @@ PikminTaskActionManagerConstructor original_pikmin_task_action_manager_construct
 TaskBool task_is_completed{};
 TaskBool task_is_faulted{};
 void *request_class{};
+void *game_domain{};
 void *rpc_manager{};
 void *planting_controller{};
 void *interaction_settings{};
@@ -617,9 +618,9 @@ void dry_run_return_tasks() {
 }
 
 void *find_class(const char *namespc, const char *name) {
-    if (!domain_get || !domain_get_assemblies || !assembly_get_image || !class_from_name) return nullptr;
+    if (!game_domain || !domain_get_assemblies || !assembly_get_image || !class_from_name) return nullptr;
     size_t count{};
-    const void **assemblies = domain_get_assemblies(domain_get(), &count);
+    const void **assemblies = domain_get_assemblies(game_domain, &count);
     for (size_t index = 0; assemblies && index < count; ++index) {
         void *klass = class_from_name(assembly_get_image(assemblies[index]), namespc, name);
         if (klass) return klass;
@@ -1517,6 +1518,21 @@ void start(const char *game_data_dir) {
     Dl_info info{};
     if (!domain_get || !object_get_class || !class_get_name || !dladdr(reinterpret_cast<void *>(domain_get), &info)) {
         LOGE("[NECTAR] unable to resolve IL2CPP runtime symbols"); return;
+    }
+    // libil2cpp is mapped before Unity finishes creating its domain.  Calling
+    // il2cpp_domain_get during that narrow window is a real v152 crash (the
+    // tombstone shows a null dereference inside libil2cpp).  Wait without
+    // touching IL2CPP, then require a non-null domain before resolving any
+    // classes or installing hooks.
+    sleep(12);
+    for (int attempt = 0; attempt < 15; ++attempt) {
+        game_domain = domain_get();
+        if (game_domain) break;
+        sleep(1);
+    }
+    if (!game_domain) {
+        LOGW("[NECTAR] IL2CPP domain did not become ready; hooks skipped");
+        return;
     }
     const auto base = reinterpret_cast<uintptr_t>(info.dli_fbase);
     std::snprintf(flower_log_path, sizeof(flower_log_path), "%s/files/nectar_flowers.tsv", game_data_dir);
