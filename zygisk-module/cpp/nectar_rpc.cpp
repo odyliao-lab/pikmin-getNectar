@@ -89,8 +89,6 @@ using GetInventoryItemId = void *(*)(void *, void *);
 using GetPikminTaskList = void *(*)(void *, void *);
 using GetPikminTaskProto = void *(*)(void *, void *);
 using GetTaskFinishTimeMs = int64_t (*)(void *, void *);
-using GetTaskLong = int64_t (*)(void *, void *);
-using GetTaskDouble = double (*)(void *, void *);
 using GetTaskVariant = void *(*)(void *, void *);
 using GetTaskInt = int (*)(void *, void *);
 using PikminTaskPreparerConstructor = void (*)(void *, void *, void *, void *, void *);
@@ -148,7 +146,6 @@ GetInventoryItemId get_inventory_item_id{};
 GetPikminTaskList original_get_pikmin_task_list{};
 GetPikminTaskProto get_pikmin_task_proto{};
 GetTaskFinishTimeMs get_task_finish_time_ms{};
-GetTaskLong get_task_start_time_ms{};
 GetTaskVariant get_task_carry{};
 GetTaskVariant get_task_expedition{};
 GetTaskVariant get_task_gift{};
@@ -176,10 +173,6 @@ GetTaskInt get_deco_box_type{};
 GetTaskInt get_rare_deco_category{};
 GetTaskInt get_task_case{};
 GetTaskInt get_expedition_target_case{};
-GetTaskLong get_expedition_expiration_time_ms{};
-GetTaskVariant get_expedition_spawn_point{};
-GetTaskDouble get_point_lat_degrees{};
-GetTaskDouble get_point_lng_degrees{};
 GetTaskInt get_resource_type{};
 GetTaskInt get_resource_num_pikmins{};
 GetTaskInt get_resource_honey_flower_kind{};
@@ -215,8 +208,6 @@ char return_postcard_policy_path[512]{};
 char return_status_path[512]{};
 char return_batch_limit_path[512]{};
 char compatibility_path[512]{};
-char dispatch_candidates_path[512]{};
-char dispatch_status_path[512]{};
 std::map<std::string, FlowerRecord> flowers;
 std::map<std::string, std::string> last_flower_state;
 long long last_tick_ms{};
@@ -507,18 +498,6 @@ void write_compatibility_status(bool compatible, off_t observed_size) {
     chmod(compatibility_path, 0644);
 }
 
-// The expedition-dispatch probe intentionally has no request sender.  Its only
-// output is a replace-in-place snapshot of unstarted fruit/seed expeditions,
-// collected through public protobuf accessors.  This gives the controller a
-// live v152 data contract to verify before any automatic dispatch is added.
-void write_dispatch_probe_status(int candidates) {
-    FILE *file = std::fopen(dispatch_status_path, "w");
-    if (!file) return;
-    std::fprintf(file, "%lld\tobserved\t%d\tno-dispatch\n", now_ms(), candidates);
-    std::fclose(file);
-    chmod(dispatch_status_path, 0644);
-}
-
 void *hooked_complete_pikmin_task(void *self, void *task_id, bool discard_postcard, void *method_info) {
     append_return_trace(discard_postcard ? "manual-discard-postcard" : "manual-keep-postcard", self, task_id);
     return original_complete_pikmin_task
@@ -568,8 +547,6 @@ void *hooked_get_pikmin_task_list(void *self, void *method_info) {
         return result;
     }
     LOGI("[RETURN-DIAG] task-list self=%p count=%d", self, count);
-    FILE *dispatch_file = std::fopen(dispatch_candidates_path, "w");
-    int dispatch_candidates = 0;
     for (int index = 0; index < count; ++index) {
         void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
         if (!task) continue;
@@ -578,30 +555,7 @@ void *hooked_get_pikmin_task_list(void *self, void *method_info) {
         const int64_t finish_ms = proto ? get_task_finish_time_ms(proto, nullptr) : 0;
         LOGI("[RETURN-DIAG] task-list-item id=%s finishMs=%" PRId64 " due=%d",
              utf8_string(id).c_str(), finish_ms, finish_ms > 0 && finish_ms <= now ? 1 : 0);
-
-        // A dispatched expedition has a start/finish time.  The two target
-        // cases below are Seed (9) and Fruit (10); do not infer other cases.
-        void *expedition = proto && get_task_expedition ? get_task_expedition(proto, nullptr) : nullptr;
-        const int64_t start_ms = proto && get_task_start_time_ms ? get_task_start_time_ms(proto, nullptr) : 0;
-        const int target_case = expedition && get_expedition_target_case
-                ? get_expedition_target_case(expedition, nullptr) : 0;
-        if (!dispatch_file || !expedition || (target_case != 9 && target_case != 10) ||
-            start_ms > 0 || finish_ms > 0) continue;
-        const int64_t expiration_ms = get_expedition_expiration_time_ms
-                ? get_expedition_expiration_time_ms(expedition, nullptr) : 0;
-        void *point = get_expedition_spawn_point ? get_expedition_spawn_point(expedition, nullptr) : nullptr;
-        const double latitude = point && get_point_lat_degrees ? get_point_lat_degrees(point, nullptr) : 0.0;
-        const double longitude = point && get_point_lng_degrees ? get_point_lng_degrees(point, nullptr) : 0.0;
-        std::fprintf(dispatch_file, "%lld\t%s\t%s\t%" PRId64 "\t%" PRId64 "\t%.7f\t%.7f\tneeds-live-estimate\n",
-                     now, target_case == 9 ? "seed" : "fruit", utf8_string(id).c_str(),
-                     start_ms, expiration_ms, latitude, longitude);
-        ++dispatch_candidates;
     }
-    if (dispatch_file) {
-        std::fclose(dispatch_file);
-        chmod(dispatch_candidates_path, 0644);
-    }
-    write_dispatch_probe_status(dispatch_candidates);
     return result;
 }
 
@@ -843,16 +797,13 @@ void install_return_diagnostic_hook() {
     void *proto_class = find_class("Ichigo.Proto", "PikminTaskProto");
     log_task_proto_methods(proto_class);
     void *finish_method = proto_class ? class_get_method_from_name(proto_class, "get_FinishTimeMs", 0) : nullptr;
-    void *start_method = proto_class ? class_get_method_from_name(proto_class, "get_StartTimeMs", 0) : nullptr;
     void *finish_entry = finish_method ? *reinterpret_cast<void **>(finish_method) : nullptr;
-    void *start_entry = start_method ? *reinterpret_cast<void **>(start_method) : nullptr;
-    if (!list_entry || !proto_entry || !finish_entry || !start_entry) {
+    if (!list_entry || !proto_entry || !finish_entry) {
         LOGE("[RETURN-DIAG] task-list or task-time method not found");
         return;
     }
     get_pikmin_task_proto = reinterpret_cast<GetPikminTaskProto>(proto_entry);
     get_task_finish_time_ms = reinterpret_cast<GetTaskFinishTimeMs>(finish_entry);
-    get_task_start_time_ms = reinterpret_cast<GetTaskLong>(start_entry);
     void *task_case = proto_class ? class_get_method_from_name(proto_class, "get_TaskCase", 0) : nullptr;
     get_task_case = task_case ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(task_case)) : nullptr;
     void *carry = proto_class ? class_get_method_from_name(proto_class, "get_Carry", 0) : nullptr;
@@ -878,19 +829,6 @@ void install_return_diagnostic_hook() {
             ? class_get_method_from_name(expedition_class, "get_TargetCase", 0) : nullptr;
     get_expedition_target_case = expedition_target_case
             ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(expedition_target_case)) : nullptr;
-    void *expedition_expiration = expedition_class
-            ? class_get_method_from_name(expedition_class, "get_ExpirationTimeMs", 0) : nullptr;
-    void *expedition_spawn_point = expedition_class
-            ? class_get_method_from_name(expedition_class, "get_SpawnPoint", 0) : nullptr;
-    get_expedition_expiration_time_ms = expedition_expiration
-            ? reinterpret_cast<GetTaskLong>(*reinterpret_cast<void **>(expedition_expiration)) : nullptr;
-    get_expedition_spawn_point = expedition_spawn_point
-            ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(expedition_spawn_point)) : nullptr;
-    void *point_class = find_class("Ichigo.Proto", "PointProto");
-    void *point_lat = point_class ? class_get_method_from_name(point_class, "get_LatDegrees", 0) : nullptr;
-    void *point_lng = point_class ? class_get_method_from_name(point_class, "get_LngDegrees", 0) : nullptr;
-    get_point_lat_degrees = point_lat ? reinterpret_cast<GetTaskDouble>(*reinterpret_cast<void **>(point_lat)) : nullptr;
-    get_point_lng_degrees = point_lng ? reinterpret_cast<GetTaskDouble>(*reinterpret_cast<void **>(point_lng)) : nullptr;
     const char *target_getters[] = {"get_Seed", "get_Fruit", "get_Gift", "get_BloomedPoi", "get_Postcard", "get_PostcardWithItems"};
     GetTaskVariant *target_functions[] = {&get_expedition_seed, &get_expedition_fruit, &get_expedition_gift,
             &get_expedition_bloomed_poi, &get_expedition_postcard, &get_expedition_postcard_with_items};
@@ -1598,8 +1536,6 @@ void start(const char *game_data_dir, JavaVM *vm) {
     std::snprintf(return_status_path, sizeof(return_status_path), "%s/files/return_rpc_status.tsv", game_data_dir);
     std::snprintf(return_batch_limit_path, sizeof(return_batch_limit_path), "/data/local/tmp/pikmin-return-batch-limit.txt");
     std::snprintf(compatibility_path, sizeof(compatibility_path), "%s/files/compatibility_status.tsv", game_data_dir);
-    std::snprintf(dispatch_candidates_path, sizeof(dispatch_candidates_path), "%s/files/dispatch_candidates.tsv", game_data_dir);
-    std::snprintf(dispatch_status_path, sizeof(dispatch_status_path), "%s/files/dispatch_probe_status.tsv", game_data_dir);
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);
