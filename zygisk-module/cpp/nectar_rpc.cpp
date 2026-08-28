@@ -59,6 +59,7 @@ constexpr size_t kFlowerBloomedTimeOffset = 0x40;
 constexpr size_t kFlowerRewardReceivedOffset = 0x48;
 
 using ObjectGetClass = void *(*)(void *);
+using ObjectGetVirtualMethod = void *(*)(void *, void *);
 using ClassGetName = const char *(*)(void *);
 using DomainGet = void *(*)();
 using DomainGetAssemblies = const void **(*)(void *, size_t *);
@@ -120,6 +121,7 @@ struct FlowerRecord {
 };
 
 ObjectGetClass object_get_class{};
+ObjectGetVirtualMethod object_get_virtual_method{};
 ClassGetName class_get_name{};
 DomainGet domain_get{};
 DomainGetAssemblies domain_get_assemblies{};
@@ -553,6 +555,13 @@ int count_enumerable_items(void *enumerable) {
     if (!move_next_method && enumerator_class) {
         move_next_method = class_get_method_from_name(enumerator_class,
                 "System.Collections.IEnumerator.MoveNext", 0);
+    }
+    if (!move_next_method && object_get_virtual_method) {
+        void *ienumerator = find_class("System.Collections", "IEnumerator");
+        void *interface_move_next = ienumerator
+                ? class_get_method_from_name(ienumerator, "MoveNext", 0) : nullptr;
+        move_next_method = interface_move_next
+                ? object_get_virtual_method(enumerator, interface_move_next) : nullptr;
     }
     auto move_next = move_next_method
             ? reinterpret_cast<EnumeratorMoveNext>(*reinterpret_cast<void **>(move_next_method)) : nullptr;
@@ -1772,6 +1781,7 @@ void start(const char *game_data_dir) {
     string_new = reinterpret_cast<StringNew>(xdl_sym(handle, "il2cpp_string_new", nullptr));
     gchandle_new = reinterpret_cast<GcHandleNew>(xdl_sym(handle, "il2cpp_gchandle_new", nullptr));
     object_get_class = reinterpret_cast<ObjectGetClass>(xdl_sym(handle, "il2cpp_object_get_class", nullptr));
+    object_get_virtual_method = reinterpret_cast<ObjectGetVirtualMethod>(xdl_sym(handle, "il2cpp_object_get_virtual_method", nullptr));
     class_get_name = reinterpret_cast<ClassGetName>(xdl_sym(handle, "il2cpp_class_get_name", nullptr));
     Dl_info info{};
     if (!domain_get || !object_get_class || !class_get_name || !dladdr(reinterpret_cast<void *>(domain_get), &info)) {
