@@ -188,6 +188,7 @@ TaskBool task_is_completed{};
 TaskBool task_is_faulted{};
 void *request_class{};
 void *game_domain{};
+bool runtime_metadata_ready{};
 void *rpc_manager{};
 void *planting_controller{};
 void *interaction_settings{};
@@ -895,6 +896,22 @@ void install_return_diagnostic_hook() {
     LOGI("[RETURN-DIAG] task-list hook installed method=%p entry=%p", list_method, list_entry);
 }
 
+// This must run from a post-login game callback.  On v152 the library is
+// mapped long before its domain is usable, and calling domain_get from the
+// detached Zygisk worker can crash inside libil2cpp itself.
+void initialize_runtime_metadata() {
+    if (runtime_metadata_ready || !domain_get) return;
+    void *domain = domain_get();
+    if (!domain) {
+        LOGW("[NECTAR] post-login IL2CPP domain unavailable; metadata deferred");
+        return;
+    }
+    game_domain = domain;
+    runtime_metadata_ready = true;
+    install_return_diagnostic_hook();
+    LOGI("[NECTAR] post-login IL2CPP metadata installed");
+}
+
 long long now_ms() {
     timespec value{};
     clock_gettime(CLOCK_REALTIME, &value);
@@ -1015,10 +1032,9 @@ double distance_metres(double lat1, double lng1, double lat2, double lng2) {
 
 bool resolve_request_class() {
     if (request_class) return true;
-    if (!domain_get || !domain_get_assemblies || !assembly_get_image || !class_from_name) return false;
-    void *domain = domain_get();
+    if (!game_domain || !domain_get_assemblies || !assembly_get_image || !class_from_name) return false;
     size_t count{};
-    const void **assemblies = domain_get_assemblies(domain, &count);
+    const void **assemblies = domain_get_assemblies(game_domain, &count);
     for (size_t index = 0; assemblies && index < count; ++index) {
         void *image = assembly_get_image(assemblies[index]);
         void *klass = class_from_name(image, "Ichigo.Proto", "ClaimPoiFlowerVisitRewardRequestProto");
@@ -1286,6 +1302,7 @@ void hooked_rpc_manager_logged_in(void *self, void *server_url, void *player_id,
     rpc_manager = self;
     LOGI("[NECTAR-DIAG] RpcManager logged in this=%p", self);
     if (original_rpc_manager_logged_in) original_rpc_manager_logged_in(self, server_url, player_id, background_token, method_info);
+    initialize_runtime_metadata();
 }
 void hooked_register_map_object(void *self, void *map_object, int tag, void *method_info) {
     if (original_register_map_object) original_register_map_object(self, map_object, tag, method_info);
@@ -1519,21 +1536,6 @@ void start(const char *game_data_dir) {
     if (!domain_get || !object_get_class || !class_get_name || !dladdr(reinterpret_cast<void *>(domain_get), &info)) {
         LOGE("[NECTAR] unable to resolve IL2CPP runtime symbols"); return;
     }
-    // libil2cpp is mapped before Unity finishes creating its domain.  Calling
-    // il2cpp_domain_get during that narrow window is a real v152 crash (the
-    // tombstone shows a null dereference inside libil2cpp).  Wait without
-    // touching IL2CPP, then require a non-null domain before resolving any
-    // classes or installing hooks.
-    sleep(12);
-    for (int attempt = 0; attempt < 15; ++attempt) {
-        game_domain = domain_get();
-        if (game_domain) break;
-        sleep(1);
-    }
-    if (!game_domain) {
-        LOGW("[NECTAR] IL2CPP domain did not become ready; hooks skipped");
-        return;
-    }
     const auto base = reinterpret_cast<uintptr_t>(info.dli_fbase);
     std::snprintf(flower_log_path, sizeof(flower_log_path), "%s/files/nectar_flowers.tsv", game_data_dir);
     std::snprintf(mode_path, sizeof(mode_path), "%s/files/nectar_rpc_mode.txt", game_data_dir);
@@ -1575,8 +1577,7 @@ void start(const char *game_data_dir) {
     install_hook(base, kPlantingStartRva, reinterpret_cast<void *>(hooked_planting_start), original_planting_start);
     install_hook(base, kPlantingStateUpdatedRva, reinterpret_cast<void *>(hooked_planting_state_updated), original_planting_state_updated);
     install_hook(base, kLocationControllerAwakeRva, reinterpret_cast<void *>(hooked_location_controller_awake), original_location_controller_awake);
-    install_return_diagnostic_hook();
-    LOGI("[NECTAR] v152 RPC hooks installed base=%" PRIxPTR " mode=%s", base, mode_path);
+    LOGI("[NECTAR] v152 direct hooks installed base=%" PRIxPTR "; metadata waits for login", base);
 }
 
 }  // namespace
