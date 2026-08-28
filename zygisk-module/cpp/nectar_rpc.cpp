@@ -104,6 +104,7 @@ using EnumeratorMoveNext = bool (*)(void *, void *);
 using EnumeratorCurrent = void *(*)(void *, void *);
 using PickFastestPikmins = void *(*)(void *, void *, void *, void *, void *);
 using SetExpeditionPikmins = void (*)(void *, void *, void *);
+using StartExpedition = void *(*)(void *, void *);
 using PikminTaskPreparerConstructor = void (*)(void *, void *, void *, void *, void *);
 using PikminTaskActionManagerConstructor = void (*)(void *, void *);
 
@@ -210,6 +211,7 @@ ExpeditionDataStoreConstructor original_expedition_data_store_constructor{};
 GetEnumerable get_pikmin_item_collection{};
 PickFastestPikmins pick_fastest_pikmins{};
 SetExpeditionPikmins set_expedition_pikmins{};
+StartExpedition start_expedition{};
 PikminTaskPreparerConstructor original_pikmin_task_preparer_constructor{};
 PikminTaskActionManagerConstructor original_pikmin_task_action_manager_constructor{};
 TaskBool task_is_completed{};
@@ -660,6 +662,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     const bool armed = read_dispatch_mode() == "armed";
     int candidates{};
     bool selection_applied{};
+    bool start_requested{};
     for (int index = 0; index < count; ++index) {
         void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
         void *proto = task ? get_pikmin_task_proto(task, nullptr) : nullptr;
@@ -707,6 +710,12 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 selection_applied = true;
                 LOGI("[DISPATCH-OBSERVE] armed selection task=%s duration=%" PRId64 " canStart=%d picked=%d",
                      id_text.c_str(), game_duration, can_start ? 1 : 0, picked_count);
+                if (game_duration > 0 && game_duration <= 5 * 60 * 1000 && can_start && start_expedition) {
+                    start_expedition(data, nullptr);
+                    start_requested = true;
+                    LOGI("[DISPATCH] start requested task=%s duration=%" PRId64 " picked=%d",
+                         id_text.c_str(), game_duration, picked_count);
+                }
             }
         }
         std::fprintf(file, "%lld\t%s\t%s\t0\t%" PRId64 "\t%.7f\t%.7f\tpending-travel-estimate\t%.1f\t%" PRId64 "\t%d\t%d\n", observed_ms,
@@ -720,7 +729,8 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     if (!status) return;
     std::fprintf(status, "%lld\t%s\t%d\t%s\n", observed_ms,
                  armed ? "armed" : "observed", candidates,
-                 selection_applied ? "selection-applied" : "no-dispatch");
+                 start_requested ? "start-requested" :
+                 (selection_applied ? "selection-applied" : "no-dispatch"));
     std::fclose(status);
     chmod(dispatch_status_path, 0644);
 }
@@ -1096,6 +1106,10 @@ void install_return_diagnostic_hook() {
             ? class_get_method_from_name(expedition_item_class, "SetPikmins", 1) : nullptr;
     set_expedition_pikmins = set_pikmins_method
             ? reinterpret_cast<SetExpeditionPikmins>(*reinterpret_cast<void **>(set_pikmins_method)) : nullptr;
+    void *start_expedition_method = expedition_item_class
+            ? class_get_method_from_name(expedition_item_class, "StartExpeditionAsync", 0) : nullptr;
+    start_expedition = start_expedition_method
+            ? reinterpret_cast<StartExpedition>(*reinterpret_cast<void **>(start_expedition_method)) : nullptr;
     void *pikmin_collection_method = inventory
             ? class_get_method_from_name(inventory, "get_PikminItemCollection", 0) : nullptr;
     get_pikmin_item_collection = pikmin_collection_method
@@ -1109,8 +1123,9 @@ void install_return_diagnostic_hook() {
         A64HookFunction(expedition_store_ctor_entry,
                         reinterpret_cast<void *>(hooked_expedition_data_store_constructor),
                         reinterpret_cast<void **>(&original_expedition_data_store_constructor));
-        LOGI("[DISPATCH-OBSERVE] store hook installed ctor=%p byIndex=%p canTryStart=%p pickFastest=%p setPikmins=%p",
-             expedition_store_ctor_entry, by_index_method, can_start_method, pick_fastest_method, set_pikmins_method);
+        LOGI("[DISPATCH-OBSERVE] store hook installed ctor=%p byIndex=%p canTryStart=%p pickFastest=%p setPikmins=%p start=%p",
+             expedition_store_ctor_entry, by_index_method, can_start_method, pick_fastest_method,
+             set_pikmins_method, start_expedition_method);
     } else {
         LOGE("[DISPATCH-OBSERVE] ExpeditionDataStore constructor not found");
     }
