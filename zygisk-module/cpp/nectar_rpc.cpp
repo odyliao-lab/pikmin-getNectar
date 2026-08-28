@@ -88,6 +88,8 @@ using GetInventoryItemId = void *(*)(void *, void *);
 using GetPikminTaskList = void *(*)(void *, void *);
 using GetPikminTaskProto = void *(*)(void *, void *);
 using GetTaskFinishTimeMs = int64_t (*)(void *, void *);
+using GetTaskLong = int64_t (*)(void *, void *);
+using GetTaskDouble = double (*)(void *, void *);
 using GetTaskVariant = void *(*)(void *, void *);
 using GetTaskInt = int (*)(void *, void *);
 using PikminTaskPreparerConstructor = void (*)(void *, void *, void *, void *, void *);
@@ -172,6 +174,10 @@ GetTaskInt get_deco_box_type{};
 GetTaskInt get_rare_deco_category{};
 GetTaskInt get_task_case{};
 GetTaskInt get_expedition_target_case{};
+GetTaskLong get_expedition_expiration_time_ms{};
+GetTaskVariant get_expedition_spawn_point{};
+GetTaskDouble get_point_lat_degrees{};
+GetTaskDouble get_point_lng_degrees{};
 GetTaskInt get_resource_type{};
 GetTaskInt get_resource_num_pikmins{};
 GetTaskInt get_resource_honey_flower_kind{};
@@ -524,11 +530,14 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         const int64_t finish_ms = proto ? get_task_finish_time_ms(proto, nullptr) : 0;
         if (!task || !expedition || (target_case != 9 && target_case != 10) || finish_ms != 0) continue;
         void *id = get_inventory_item_id ? get_inventory_item_id(task, nullptr) : nullptr;
-        // Retain the v1 TSV shape expected by the controller.  Coordinates
-        // and expiration are deliberately zero until their getters have been
-        // independently verified on this exact game build.
-        std::fprintf(file, "%lld\t%s\t%s\t0\t0\t0\t0\tpending-metadata\n", observed_ms,
-                     target_case == 9 ? "seed" : "fruit", utf8_string(id).c_str());
+        const int64_t expiration_ms = get_expedition_expiration_time_ms
+                ? get_expedition_expiration_time_ms(expedition, nullptr) : 0;
+        void *point = get_expedition_spawn_point ? get_expedition_spawn_point(expedition, nullptr) : nullptr;
+        const double latitude = point && get_point_lat_degrees ? get_point_lat_degrees(point, nullptr) : 0.0;
+        const double longitude = point && get_point_lng_degrees ? get_point_lng_degrees(point, nullptr) : 0.0;
+        std::fprintf(file, "%lld\t%s\t%s\t0\t%" PRId64 "\t%.7f\t%.7f\tpending-travel-estimate\n", observed_ms,
+                     target_case == 9 ? "seed" : "fruit", utf8_string(id).c_str(),
+                     expiration_ms, latitude, longitude);
         ++candidates;
     }
     std::fclose(file);
@@ -872,6 +881,19 @@ void install_return_diagnostic_hook() {
             ? class_get_method_from_name(expedition_class, "get_TargetCase", 0) : nullptr;
     get_expedition_target_case = expedition_target_case
             ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(expedition_target_case)) : nullptr;
+    void *expedition_expiration = expedition_class
+            ? class_get_method_from_name(expedition_class, "get_ExpirationTimeMs", 0) : nullptr;
+    void *expedition_spawn_point = expedition_class
+            ? class_get_method_from_name(expedition_class, "get_SpawnPoint", 0) : nullptr;
+    get_expedition_expiration_time_ms = expedition_expiration
+            ? reinterpret_cast<GetTaskLong>(*reinterpret_cast<void **>(expedition_expiration)) : nullptr;
+    get_expedition_spawn_point = expedition_spawn_point
+            ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(expedition_spawn_point)) : nullptr;
+    void *point_class = find_class("Ichigo.Proto", "PointProto");
+    void *point_lat = point_class ? class_get_method_from_name(point_class, "get_LatDegrees", 0) : nullptr;
+    void *point_lng = point_class ? class_get_method_from_name(point_class, "get_LngDegrees", 0) : nullptr;
+    get_point_lat_degrees = point_lat ? reinterpret_cast<GetTaskDouble>(*reinterpret_cast<void **>(point_lat)) : nullptr;
+    get_point_lng_degrees = point_lng ? reinterpret_cast<GetTaskDouble>(*reinterpret_cast<void **>(point_lng)) : nullptr;
     const char *target_getters[] = {"get_Seed", "get_Fruit", "get_Gift", "get_BloomedPoi", "get_Postcard", "get_PostcardWithItems"};
     GetTaskVariant *target_functions[] = {&get_expedition_seed, &get_expedition_fruit, &get_expedition_gift,
             &get_expedition_bloomed_poi, &get_expedition_postcard, &get_expedition_postcard_with_items};
