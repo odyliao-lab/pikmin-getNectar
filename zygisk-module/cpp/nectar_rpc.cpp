@@ -96,6 +96,10 @@ using GetExpeditionDurationMs = int64_t (*)(void *, void *);
 using GetExpeditionDataByIndex = void *(*)(void *, int, void *, void *);
 using GetExpeditionBool = bool (*)(void *, void *);
 using ExpeditionDataStoreConstructor = void (*)(void *, void *);
+using GetEnumerable = void *(*)(void *, void *);
+using EnumeratorMoveNext = bool (*)(void *, void *);
+using EnumeratorCurrent = void *(*)(void *, void *);
+using PickFastestPikmins = void *(*)(void *, void *, void *, void *, void *);
 using PikminTaskPreparerConstructor = void (*)(void *, void *, void *, void *, void *);
 using PikminTaskActionManagerConstructor = void (*)(void *, void *);
 
@@ -197,6 +201,8 @@ GetExpeditionDurationMs original_get_expedition_total_duration_ms{};
 GetExpeditionDataByIndex get_expedition_data_by_index{};
 GetExpeditionBool get_expedition_can_try_start{};
 ExpeditionDataStoreConstructor original_expedition_data_store_constructor{};
+GetEnumerable get_pikmin_item_collection{};
+PickFastestPikmins pick_fastest_pikmins{};
 PikminTaskPreparerConstructor original_pikmin_task_preparer_constructor{};
 PikminTaskActionManagerConstructor original_pikmin_task_action_manager_constructor{};
 TaskBool task_is_completed{};
@@ -528,6 +534,25 @@ void write_compatibility_status(bool compatible, off_t observed_size) {
 // task Proto, FinishTimeMs, Expedition and TargetCase.  No new game method is
 // resolved or hooked here, so the first live validation is limited to safely
 // identifying unstarted Seed/Fruit candidates.
+int count_enumerable_items(void *enumerable) {
+    if (!enumerable || !object_get_class || !class_get_method_from_name) return 0;
+    void *enumerable_class = object_get_class(enumerable);
+    void *get_enumerator_method = enumerable_class
+            ? class_get_method_from_name(enumerable_class, "GetEnumerator", 0) : nullptr;
+    auto get_enumerator = get_enumerator_method
+            ? reinterpret_cast<GetEnumerable>(*reinterpret_cast<void **>(get_enumerator_method)) : nullptr;
+    void *enumerator = get_enumerator ? get_enumerator(enumerable, nullptr) : nullptr;
+    void *enumerator_class = enumerator && object_get_class ? object_get_class(enumerator) : nullptr;
+    void *move_next_method = enumerator_class
+            ? class_get_method_from_name(enumerator_class, "MoveNext", 0) : nullptr;
+    auto move_next = move_next_method
+            ? reinterpret_cast<EnumeratorMoveNext>(*reinterpret_cast<void **>(move_next_method)) : nullptr;
+    if (!move_next) return 0;
+    int count{};
+    while (count < 100 && move_next(enumerator, nullptr)) ++count;
+    return count;
+}
+
 void write_dispatch_candidates(void *list, long long observed_ms) {
     if (!list || !get_pikmin_task_proto || !get_task_finish_time_ms ||
         !get_task_expedition || !get_expedition_target_case) return;
@@ -563,9 +588,16 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         const bool can_start = data && get_expedition_can_try_start
                 ? get_expedition_can_try_start(data, nullptr) : false;
         if (game_duration <= 0 && id_text == observed_expedition_task_id) game_duration = observed_expedition_duration_ms;
-        std::fprintf(file, "%lld\t%s\t%s\t0\t%" PRId64 "\t%.7f\t%.7f\tpending-travel-estimate\t%.1f\t%" PRId64 "\t%d\n", observed_ms,
+        void *utils = data ? *reinterpret_cast<void **>(static_cast<uint8_t *>(data) + 0x48) : nullptr;
+        void *scope = data ? *reinterpret_cast<void **>(static_cast<uint8_t *>(data) + 0x98) : nullptr;
+        void *pikmins = return_inventory_manager && get_pikmin_item_collection
+                ? get_pikmin_item_collection(return_inventory_manager, nullptr) : nullptr;
+        void *picked = utils && pick_fastest_pikmins && pikmins && scope
+                ? pick_fastest_pikmins(utils, data, pikmins, scope, nullptr) : nullptr;
+        const int picked_count = count_enumerable_items(picked);
+        std::fprintf(file, "%lld\t%s\t%s\t0\t%" PRId64 "\t%.7f\t%.7f\tpending-travel-estimate\t%.1f\t%" PRId64 "\t%d\t%d\n", observed_ms,
                      target_case == 9 ? "seed" : "fruit", id_text.c_str(),
-                     expiration_ms, latitude, longitude, distance, game_duration, can_start ? 1 : 0);
+                     expiration_ms, latitude, longitude, distance, game_duration, can_start ? 1 : 0, picked_count);
         ++candidates;
     }
     std::fclose(file);
@@ -944,12 +976,21 @@ void install_return_diagnostic_hook() {
             ? class_get_method_from_name(expedition_item_class, "get_CanTryStart", 0) : nullptr;
     get_expedition_can_try_start = can_start_method
             ? reinterpret_cast<GetExpeditionBool>(*reinterpret_cast<void **>(can_start_method)) : nullptr;
+    void *pikmin_collection_method = inventory
+            ? class_get_method_from_name(inventory, "get_PikminItemCollection", 0) : nullptr;
+    get_pikmin_item_collection = pikmin_collection_method
+            ? reinterpret_cast<GetEnumerable>(*reinterpret_cast<void **>(pikmin_collection_method)) : nullptr;
+    void *utils_class = find_class("Niantic.Ichigo.Game.Expedition", "ExpeditionUtils");
+    void *pick_fastest_method = utils_class ? class_get_method_from_name(utils_class,
+            "PickFastestUpToItemLimitsReservingForTroop", 3) : nullptr;
+    pick_fastest_pikmins = pick_fastest_method
+            ? reinterpret_cast<PickFastestPikmins>(*reinterpret_cast<void **>(pick_fastest_method)) : nullptr;
     if (expedition_store_ctor_entry) {
         A64HookFunction(expedition_store_ctor_entry,
                         reinterpret_cast<void *>(hooked_expedition_data_store_constructor),
                         reinterpret_cast<void **>(&original_expedition_data_store_constructor));
-        LOGI("[DISPATCH-OBSERVE] store hook installed ctor=%p byIndex=%p canTryStart=%p",
-             expedition_store_ctor_entry, by_index_method, can_start_method);
+        LOGI("[DISPATCH-OBSERVE] store hook installed ctor=%p byIndex=%p canTryStart=%p pickFastest=%p",
+             expedition_store_ctor_entry, by_index_method, can_start_method, pick_fastest_method);
     } else {
         LOGE("[DISPATCH-OBSERVE] ExpeditionDataStore constructor not found");
     }
