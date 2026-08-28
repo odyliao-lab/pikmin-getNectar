@@ -635,7 +635,11 @@ void dry_run_return_tasks() {
         !original_should_prepare_completion || !get_inventory_item_id ||
         now - last_return_dry_run_ms < 5000) return;
     last_return_dry_run_ms = now;
-    void *list = original_get_pikmin_task_list(return_inventory_manager, nullptr);
+    // Route the already verified background inventory read through the same
+    // passive scanner used by the expedition UI.  Calling the original entry
+    // directly here bypasses the inline hook, which previously left the
+    // controller with no candidate snapshot unless that exact UI getter ran.
+    void *list = hooked_get_pikmin_task_list(return_inventory_manager, nullptr);
     if (!list) return;
     void *items = *reinterpret_cast<void **>(static_cast<uint8_t *>(list) + 0x10);
     const int count = *reinterpret_cast<int *>(static_cast<uint8_t *>(list) + 0x18);
