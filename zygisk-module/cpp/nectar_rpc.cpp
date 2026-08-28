@@ -14,6 +14,7 @@
 #include <map>
 #include <net/if.h>
 #include <string>
+#include <vector>
 #include <sys/stat.h>
 #include <thread>
 #include <time.h>
@@ -70,6 +71,7 @@ using ClassGetMethods = void *(*)(void *, void **);
 using MethodGetName = const char *(*)(void *);
 using MethodGetParamCount = uint32_t (*)(void *);
 using ObjectNew = void *(*)(void *);
+using ArrayNew = void *(*)(void *, size_t);
 using StringNew = void *(*)(const char *);
 using GcHandleNew = uint32_t (*)(void *, bool);
 using TaskBool = bool (*)(void *, void *);
@@ -101,6 +103,7 @@ using GetEnumerable = void *(*)(void *, void *);
 using EnumeratorMoveNext = bool (*)(void *, void *);
 using EnumeratorCurrent = void *(*)(void *, void *);
 using PickFastestPikmins = void *(*)(void *, void *, void *, void *, void *);
+using SetExpeditionPikmins = void (*)(void *, void *, void *);
 using PikminTaskPreparerConstructor = void (*)(void *, void *, void *, void *, void *);
 using PikminTaskActionManagerConstructor = void (*)(void *, void *);
 
@@ -132,6 +135,7 @@ ClassGetMethods class_get_methods{};
 MethodGetName method_get_name{};
 MethodGetParamCount method_get_param_count{};
 ObjectNew object_new{};
+ArrayNew array_new{};
 StringNew string_new{};
 GcHandleNew gchandle_new{};
 RegisterMapObject original_register_map_object{};
@@ -205,6 +209,7 @@ GetExpeditionBool get_expedition_can_try_start{};
 ExpeditionDataStoreConstructor original_expedition_data_store_constructor{};
 GetEnumerable get_pikmin_item_collection{};
 PickFastestPikmins pick_fastest_pikmins{};
+SetExpeditionPikmins set_expedition_pikmins{};
 PikminTaskPreparerConstructor original_pikmin_task_preparer_constructor{};
 PikminTaskActionManagerConstructor original_pikmin_task_action_manager_constructor{};
 TaskBool task_is_completed{};
@@ -279,6 +284,7 @@ void *find_class(const char *namespaze, const char *name);
 void log_task_variant_metadata(void *proto);
 bool current_location(double &latitude, double &longitude);
 double distance_metres(double lat1, double lng1, double lat2, double lng2);
+std::string read_dispatch_mode();
 
 std::string utf8_string(void *value) {
     if (!value) return {};
@@ -587,6 +593,45 @@ int count_enumerable_items(void *enumerable) {
     return count;
 }
 
+// The game's SetPikmins API accepts IEnumerable<string>.  A managed string[]
+// implements that interface, so it avoids fabricating a generic List<T> and
+// keeps the hand-off entirely inside the game's managed runtime.
+void *picked_pikmin_ids_array(void *enumerable) {
+    if (!enumerable || !object_get_class || !class_get_method_from_name ||
+        !object_get_virtual_method || !get_inventory_item_id || !array_new) return nullptr;
+    void *ienumerable = find_class("System.Collections", "IEnumerable");
+    void *ienumerator = find_class("System.Collections", "IEnumerator");
+    void *string_class = find_class("System", "String");
+    void *get_method = ienumerable ? class_get_method_from_name(ienumerable, "GetEnumerator", 0) : nullptr;
+    void *move_method = ienumerator ? class_get_method_from_name(ienumerator, "MoveNext", 0) : nullptr;
+    void *current_method = ienumerator ? class_get_method_from_name(ienumerator, "get_Current", 0) : nullptr;
+    void *get_impl = get_method ? object_get_virtual_method(enumerable, get_method) : nullptr;
+    auto get_enumerator = get_impl ? reinterpret_cast<GetEnumerable>(*reinterpret_cast<void **>(get_impl)) : nullptr;
+    void *enumerator = get_enumerator ? get_enumerator(enumerable, nullptr) : nullptr;
+    void *move_impl = enumerator && move_method ? object_get_virtual_method(enumerator, move_method) : nullptr;
+    void *current_impl = enumerator && current_method ? object_get_virtual_method(enumerator, current_method) : nullptr;
+    auto move_next = move_impl ? reinterpret_cast<EnumeratorMoveNext>(*reinterpret_cast<void **>(move_impl)) : nullptr;
+    auto current = current_impl ? reinterpret_cast<EnumeratorCurrent>(*reinterpret_cast<void **>(current_impl)) : nullptr;
+    if (!enumerator || !move_next || !current || !string_class) {
+        LOGI("[DISPATCH-OBSERVE] ids unresolved enumerable=%p enumerator=%p get=%p move=%p current=%p",
+             enumerable, enumerator, get_impl, move_impl, current_impl);
+        return nullptr;
+    }
+    std::vector<void *> ids;
+    while (ids.size() < 100 && move_next(enumerator, nullptr)) {
+        void *pikmin = current(enumerator, nullptr);
+        void *id = pikmin ? get_inventory_item_id(pikmin, nullptr) : nullptr;
+        if (id) ids.push_back(id);
+    }
+    if (ids.empty()) return nullptr;
+    void *array = array_new(string_class, ids.size());
+    if (!array) return nullptr;
+    auto **values = reinterpret_cast<void **>(static_cast<uint8_t *>(array) + 0x20);
+    for (size_t index = 0; index < ids.size(); ++index) values[index] = ids[index];
+    LOGI("[DISPATCH-OBSERVE] selected %zu Pikmin ids array=%p", ids.size(), array);
+    return array;
+}
+
 void log_dispatch_enumerable_metadata(void *object, const char *label) {
     if (!object || !object_get_class || !class_get_methods || !method_get_name || dispatch_enumerable_metadata_logged) return;
     dispatch_enumerable_metadata_logged = true;
@@ -612,7 +657,9 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     if (!file) return;
     double current_latitude{}, current_longitude{};
     const bool has_current_location = current_location(current_latitude, current_longitude);
+    const bool armed = read_dispatch_mode() == "armed";
     int candidates{};
+    bool selection_applied{};
     for (int index = 0; index < count; ++index) {
         void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
         void *proto = task ? get_pikmin_task_proto(task, nullptr) : nullptr;
@@ -633,7 +680,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 ? get_expedition_data_by_index(expedition_data_store, 0, id, nullptr) : nullptr;
         int64_t game_duration = data && original_get_expedition_total_duration_ms
                 ? original_get_expedition_total_duration_ms(data, nullptr) : 0;
-        const bool can_start = data && get_expedition_can_try_start
+        bool can_start = data && get_expedition_can_try_start
                 ? get_expedition_can_try_start(data, nullptr) : false;
         if (game_duration <= 0 && id_text == observed_expedition_task_id) game_duration = observed_expedition_duration_ms;
         void *utils = data ? *reinterpret_cast<void **>(static_cast<uint8_t *>(data) + 0x48) : nullptr;
@@ -644,6 +691,24 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 ? pick_fastest_pikmins(utils, data, pikmins, scope, nullptr) : nullptr;
         log_dispatch_enumerable_metadata(picked ? picked : pikmins, picked ? "picked" : "pikminCollection");
         const int picked_count = count_enumerable_items(picked);
+        // Phase two: when armed, update exactly one nearby task with the
+        // game's own fastest team.  This still does not start an expedition;
+        // it establishes the real duration and CanTryStart state that the
+        // final dispatch gate will require.
+        if (armed && !selection_applied && data && picked && set_expedition_pikmins &&
+            distance >= 0.0 && distance <= 1000.0) {
+            void *ids = picked_pikmin_ids_array(picked);
+            if (ids) {
+                set_expedition_pikmins(data, ids, nullptr);
+                game_duration = original_get_expedition_total_duration_ms
+                        ? original_get_expedition_total_duration_ms(data, nullptr) : game_duration;
+                can_start = get_expedition_can_try_start
+                        ? get_expedition_can_try_start(data, nullptr) : can_start;
+                selection_applied = true;
+                LOGI("[DISPATCH-OBSERVE] armed selection task=%s duration=%" PRId64 " canStart=%d picked=%d",
+                     id_text.c_str(), game_duration, can_start ? 1 : 0, picked_count);
+            }
+        }
         std::fprintf(file, "%lld\t%s\t%s\t0\t%" PRId64 "\t%.7f\t%.7f\tpending-travel-estimate\t%.1f\t%" PRId64 "\t%d\t%d\n", observed_ms,
                      target_case == 9 ? "seed" : "fruit", id_text.c_str(),
                      expiration_ms, latitude, longitude, distance, game_duration, can_start ? 1 : 0, picked_count);
@@ -653,7 +718,9 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     chmod(dispatch_candidates_path, 0644);
     FILE *status = std::fopen(dispatch_status_path, "w");
     if (!status) return;
-    std::fprintf(status, "%lld\tobserved\t%d\tno-dispatch\n", observed_ms, candidates);
+    std::fprintf(status, "%lld\t%s\t%d\t%s\n", observed_ms,
+                 armed ? "armed" : "observed", candidates,
+                 selection_applied ? "selection-applied" : "no-dispatch");
     std::fclose(status);
     chmod(dispatch_status_path, 0644);
 }
@@ -1025,6 +1092,10 @@ void install_return_diagnostic_hook() {
             ? class_get_method_from_name(expedition_item_class, "get_CanTryStart", 0) : nullptr;
     get_expedition_can_try_start = can_start_method
             ? reinterpret_cast<GetExpeditionBool>(*reinterpret_cast<void **>(can_start_method)) : nullptr;
+    void *set_pikmins_method = expedition_item_class
+            ? class_get_method_from_name(expedition_item_class, "SetPikmins", 1) : nullptr;
+    set_expedition_pikmins = set_pikmins_method
+            ? reinterpret_cast<SetExpeditionPikmins>(*reinterpret_cast<void **>(set_pikmins_method)) : nullptr;
     void *pikmin_collection_method = inventory
             ? class_get_method_from_name(inventory, "get_PikminItemCollection", 0) : nullptr;
     get_pikmin_item_collection = pikmin_collection_method
@@ -1038,8 +1109,8 @@ void install_return_diagnostic_hook() {
         A64HookFunction(expedition_store_ctor_entry,
                         reinterpret_cast<void *>(hooked_expedition_data_store_constructor),
                         reinterpret_cast<void **>(&original_expedition_data_store_constructor));
-        LOGI("[DISPATCH-OBSERVE] store hook installed ctor=%p byIndex=%p canTryStart=%p pickFastest=%p",
-             expedition_store_ctor_entry, by_index_method, can_start_method, pick_fastest_method);
+        LOGI("[DISPATCH-OBSERVE] store hook installed ctor=%p byIndex=%p canTryStart=%p pickFastest=%p setPikmins=%p",
+             expedition_store_ctor_entry, by_index_method, can_start_method, pick_fastest_method, set_pikmins_method);
     } else {
         LOGE("[DISPATCH-OBSERVE] ExpeditionDataStore constructor not found");
     }
@@ -1794,6 +1865,7 @@ void start(const char *game_data_dir) {
     method_get_name = reinterpret_cast<MethodGetName>(xdl_sym(handle, "il2cpp_method_get_name", nullptr));
     method_get_param_count = reinterpret_cast<MethodGetParamCount>(xdl_sym(handle, "il2cpp_method_get_param_count", nullptr));
     object_new = reinterpret_cast<ObjectNew>(xdl_sym(handle, "il2cpp_object_new", nullptr));
+    array_new = reinterpret_cast<ArrayNew>(xdl_sym(handle, "il2cpp_array_new", nullptr));
     string_new = reinterpret_cast<StringNew>(xdl_sym(handle, "il2cpp_string_new", nullptr));
     gchandle_new = reinterpret_cast<GcHandleNew>(xdl_sym(handle, "il2cpp_gchandle_new", nullptr));
     object_get_class = reinterpret_cast<ObjectGetClass>(xdl_sym(handle, "il2cpp_object_get_class", nullptr));
