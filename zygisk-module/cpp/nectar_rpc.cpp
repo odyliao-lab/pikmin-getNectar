@@ -1629,10 +1629,7 @@ void start(const char *game_data_dir, JavaVM *vm) {
     install_hook(base, kPlantingStateUpdatedRva, reinterpret_cast<void *>(hooked_planting_state_updated), original_planting_state_updated);
     install_hook(base, kLocationControllerAwakeRva, reinterpret_cast<void *>(hooked_location_controller_awake), original_location_controller_awake);
     install_return_diagnostic_hook();
-    // Disabled pending a separate v152 hook-order investigation.  The direct
-    // GPS hook is independent of nectar/return/dispatch work, and must not
-    // make the game process unstable while the dispatch probe is validated.
-    (void) vm;
+    gps_copy_prepare(base, game_data_dir, vm);
     LOGI("[NECTAR] v152 RPC hooks installed base=%" PRIxPTR " mode=%s", base, mode_path);
 }
 
