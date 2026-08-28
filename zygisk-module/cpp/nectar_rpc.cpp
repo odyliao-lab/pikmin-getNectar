@@ -207,8 +207,6 @@ char return_postcard_policy_path[512]{};
 char return_status_path[512]{};
 char return_batch_limit_path[512]{};
 char compatibility_path[512]{};
-char dispatch_candidates_path[512]{};
-char dispatch_status_path[512]{};
 std::map<std::string, FlowerRecord> flowers;
 std::map<std::string, std::string> last_flower_state;
 long long last_tick_ms{};
@@ -499,45 +497,6 @@ void write_compatibility_status(bool compatible, off_t observed_size) {
     chmod(compatibility_path, 0644);
 }
 
-// Conservative phase-one expedition probe.  It intentionally reuses only
-// protobuf accessors that are already exercised by the return-reward engine:
-// task Proto, FinishTimeMs, Expedition and TargetCase.  No new game method is
-// resolved or hooked here, so the first live validation is limited to safely
-// identifying unstarted Seed/Fruit candidates.
-void write_dispatch_candidates(void *list, long long observed_ms) {
-    if (!list || !get_pikmin_task_proto || !get_task_finish_time_ms ||
-        !get_task_expedition || !get_expedition_target_case) return;
-    auto *bytes = static_cast<uint8_t *>(list);
-    void *items = *reinterpret_cast<void **>(bytes + 0x10);
-    const int count = *reinterpret_cast<int *>(bytes + 0x18);
-    if (!items || count < 0 || count > 128) return;
-    FILE *file = std::fopen(dispatch_candidates_path, "w");
-    if (!file) return;
-    int candidates{};
-    for (int index = 0; index < count; ++index) {
-        void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
-        void *proto = task ? get_pikmin_task_proto(task, nullptr) : nullptr;
-        void *expedition = proto ? get_task_expedition(proto, nullptr) : nullptr;
-        const int target_case = expedition ? get_expedition_target_case(expedition, nullptr) : 0;
-        const int64_t finish_ms = proto ? get_task_finish_time_ms(proto, nullptr) : 0;
-        if (!task || !expedition || (target_case != 9 && target_case != 10) || finish_ms != 0) continue;
-        void *id = get_inventory_item_id ? get_inventory_item_id(task, nullptr) : nullptr;
-        // Retain the v1 TSV shape expected by the controller.  Coordinates
-        // and expiration are deliberately zero until their getters have been
-        // independently verified on this exact game build.
-        std::fprintf(file, "%lld\t%s\t%s\t0\t0\t0\t0\tpending-metadata\n", observed_ms,
-                     target_case == 9 ? "seed" : "fruit", utf8_string(id).c_str());
-        ++candidates;
-    }
-    std::fclose(file);
-    chmod(dispatch_candidates_path, 0644);
-    FILE *status = std::fopen(dispatch_status_path, "w");
-    if (!status) return;
-    std::fprintf(status, "%lld\tobserved\t%d\tno-dispatch\n", observed_ms, candidates);
-    std::fclose(status);
-    chmod(dispatch_status_path, 0644);
-}
-
 void *hooked_complete_pikmin_task(void *self, void *task_id, bool discard_postcard, void *method_info) {
     append_return_trace(discard_postcard ? "manual-discard-postcard" : "manual-keep-postcard", self, task_id);
     return original_complete_pikmin_task
@@ -631,7 +590,6 @@ void dry_run_return_tasks() {
     last_return_dry_run_ms = now;
     void *list = original_get_pikmin_task_list(return_inventory_manager, nullptr);
     if (!list) return;
-    write_dispatch_candidates(list, now);
     void *items = *reinterpret_cast<void **>(static_cast<uint8_t *>(list) + 0x10);
     const int count = *reinterpret_cast<int *>(static_cast<uint8_t *>(list) + 0x18);
     if (!items || count < 0 || count > 128) return;
@@ -1577,8 +1535,6 @@ void start(const char *game_data_dir) {
     std::snprintf(return_status_path, sizeof(return_status_path), "%s/files/return_rpc_status.tsv", game_data_dir);
     std::snprintf(return_batch_limit_path, sizeof(return_batch_limit_path), "/data/local/tmp/pikmin-return-batch-limit.txt");
     std::snprintf(compatibility_path, sizeof(compatibility_path), "%s/files/compatibility_status.tsv", game_data_dir);
-    std::snprintf(dispatch_candidates_path, sizeof(dispatch_candidates_path), "%s/files/dispatch_candidates.tsv", game_data_dir);
-    std::snprintf(dispatch_status_path, sizeof(dispatch_status_path), "%s/files/dispatch_probe_status.tsv", game_data_dir);
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);
