@@ -10,6 +10,7 @@
 #include <cerrno>
 #include <cstdlib>
 #include <dlfcn.h>
+#include <fstream>
 #include <ifaddrs.h>
 #include <map>
 #include <net/if.h>
@@ -243,6 +244,11 @@ char compatibility_path[512]{};
 char dispatch_candidates_path[512]{};
 char dispatch_status_path[512]{};
 char dispatch_mode_path[512]{};
+char dispatch_target_path[512]{};
+char dispatch_ready_path[512]{};
+char dispatch_history_path[512]{};
+char dispatch_diagnostics_path[512]{};
+std::string dispatch_confirmation_pending_id;
 std::string observed_expedition_task_id;
 int64_t observed_expedition_duration_ms{};
 std::map<std::string, FlowerRecord> flowers;
@@ -287,6 +293,10 @@ void log_task_variant_metadata(void *proto);
 bool current_location(double &latitude, double &longitude);
 double distance_metres(double lat1, double lng1, double lat2, double lng2);
 std::string read_dispatch_mode();
+std::string read_dispatch_target();
+bool dispatch_target_is_ready(const std::string &target_id, long long observed_ms);
+void append_dispatch_history(const char *event, const char *kind, const std::string &task_id,
+                             int64_t duration_ms, int picked_count);
 
 std::string utf8_string(void *value) {
     if (!value) return {};
@@ -659,18 +669,57 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     if (!file) return;
     double current_latitude{}, current_longitude{};
     const bool has_current_location = current_location(current_latitude, current_longitude);
-    const bool armed = read_dispatch_mode() == "armed";
+    const std::string dispatch_mode = read_dispatch_mode();
+    const bool armed = dispatch_mode == "armed";
+    const bool batch = dispatch_mode == "batch";
+    const std::string batch_target = batch ? read_dispatch_target() : "";
+    const bool batch_ready = batch && !batch_target.empty() &&
+            dispatch_target_is_ready(batch_target, observed_ms);
     int candidates{};
+    int expedition_tasks{};
+    int finished_expedition_tasks{};
+    int direct_seed_targets{}, direct_fruit_targets{}, gift_targets{}, bloomed_poi_targets{}, other_targets{};
+    std::map<int, int> target_cases;
+    std::map<int, int> unfinished_target_cases;
     bool selection_applied{};
     bool start_requested{};
+    bool pending_confirmation_seen{};
     for (int index = 0; index < count; ++index) {
         void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
         void *proto = task ? get_pikmin_task_proto(task, nullptr) : nullptr;
         void *expedition = proto ? get_task_expedition(proto, nullptr) : nullptr;
         const int target_case = expedition ? get_expedition_target_case(expedition, nullptr) : 0;
         const int64_t finish_ms = proto ? get_task_finish_time_ms(proto, nullptr) : 0;
-        if (!task || !expedition || (target_case != 9 && target_case != 10) || finish_ms != 0) continue;
+        void *seed_target = expedition && get_expedition_seed ? get_expedition_seed(expedition, nullptr) : nullptr;
+        void *fruit_target = expedition && get_expedition_fruit ? get_expedition_fruit(expedition, nullptr) : nullptr;
+        void *bloomed_poi_target = expedition && get_expedition_bloomed_poi ? get_expedition_bloomed_poi(expedition, nullptr) : nullptr;
+        if (expedition) {
+            ++expedition_tasks;
+            ++target_cases[target_case];
+            if (finish_ms != 0) ++finished_expedition_tasks;
+            else ++unfinished_target_cases[target_case];
+            if (seed_target) ++direct_seed_targets;
+            else if (fruit_target) ++direct_fruit_targets;
+            else if (get_expedition_gift && get_expedition_gift(expedition, nullptr)) ++gift_targets;
+            else if (get_expedition_bloomed_poi && get_expedition_bloomed_poi(expedition, nullptr)) ++bloomed_poi_targets;
+            else ++other_targets;
+        }
+        // The visible fruit list contains both direct Fruit targets and
+        // BloomedPoi targets whose reward is a fruit collection. Gifts remain
+        // deliberately excluded until their own native start path is proven.
+        const char *kind = seed_target ? "seed" : (fruit_target || bloomed_poi_target ? "fruit" : nullptr);
+        if (!task || !expedition || !kind) continue;
         void *id = get_inventory_item_id ? get_inventory_item_id(task, nullptr) : nullptr;
+        const std::string id_text = utf8_string(id);
+        if (!dispatch_confirmation_pending_id.empty() && id_text == dispatch_confirmation_pending_id)
+            pending_confirmation_seen = true;
+        if (finish_ms != 0) {
+            if (!dispatch_confirmation_pending_id.empty() && id_text == dispatch_confirmation_pending_id) {
+                append_dispatch_history("inventory-confirmed", kind, id_text, 0, 0);
+                dispatch_confirmation_pending_id.clear();
+            }
+            continue;
+        }
         const int64_t expiration_ms = get_expedition_expiration_time_ms
                 ? get_expedition_expiration_time_ms(expedition, nullptr) : 0;
         void *point = get_expedition_spawn_point ? get_expedition_spawn_point(expedition, nullptr) : nullptr;
@@ -678,7 +727,6 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         const double longitude = point && get_point_lng_degrees ? get_point_lng_degrees(point, nullptr) : 0.0;
         const double distance = has_current_location && (latitude != 0.0 || longitude != 0.0)
                 ? distance_metres(current_latitude, current_longitude, latitude, longitude) : -1.0;
-        const std::string id_text = utf8_string(id);
         void *data = expedition_data_store && get_expedition_data_by_index
                 ? get_expedition_data_by_index(expedition_data_store, 0, id, nullptr) : nullptr;
         int64_t game_duration = data && original_get_expedition_total_duration_ms
@@ -698,8 +746,14 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         // game's own fastest team.  This still does not start an expedition;
         // it establishes the real duration and CanTryStart state that the
         // final dispatch gate will require.
-        if (armed && !selection_applied && data && picked && set_expedition_pikmins &&
-            distance >= 0.0 && distance <= 1000.0) {
+        // Legacy armed mode retains the previously validated nearby single-task
+        // behaviour. Batch mode is stricter: the Control Center must name this
+        // exact task and prove a fresh five-second arrival gate before any game
+        // API is invoked. The native side rechecks the live game location.
+        const bool requested = armed || (batch_ready && id_text == batch_target);
+        const double allowed_distance = batch ? 25.0 : 1000.0;
+        if (requested && !selection_applied && data && picked && set_expedition_pikmins &&
+            distance >= 0.0 && distance <= allowed_distance) {
             void *ids = picked_pikmin_ids_array(picked);
             if (ids) {
                 set_expedition_pikmins(data, ids, nullptr);
@@ -713,26 +767,51 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 if (game_duration > 0 && game_duration <= 5 * 60 * 1000 && can_start && start_expedition) {
                     start_expedition(data, nullptr);
                     start_requested = true;
+                    dispatch_confirmation_pending_id = id_text;
+                    append_dispatch_history("start-requested", kind, id_text, game_duration, picked_count);
                     LOGI("[DISPATCH] start requested task=%s duration=%" PRId64 " picked=%d",
                          id_text.c_str(), game_duration, picked_count);
                 }
             }
         }
         std::fprintf(file, "%lld\t%s\t%s\t0\t%" PRId64 "\t%.7f\t%.7f\tpending-travel-estimate\t%.1f\t%" PRId64 "\t%d\t%d\n", observed_ms,
-                     target_case == 9 ? "seed" : "fruit", id_text.c_str(),
+                     kind, id_text.c_str(),
                      expiration_ms, latitude, longitude, distance, game_duration, can_start ? 1 : 0, picked_count);
         ++candidates;
+    }
+    // GetPikminTaskList is the live inventory projection. Once a task that was
+    // just submitted is absent from a later complete projection, record that
+    // separately from the request rather than pretending the async call alone
+    // was confirmation.
+    if (!dispatch_confirmation_pending_id.empty() && !pending_confirmation_seen) {
+        append_dispatch_history("inventory-confirmed-absent", "unknown",
+                                dispatch_confirmation_pending_id, 0, 0);
+        dispatch_confirmation_pending_id.clear();
     }
     std::fclose(file);
     chmod(dispatch_candidates_path, 0644);
     FILE *status = std::fopen(dispatch_status_path, "w");
     if (!status) return;
     std::fprintf(status, "%lld\t%s\t%d\t%s\n", observed_ms,
-                 armed ? "armed" : "observed", candidates,
+                 armed ? "armed" : (batch ? "batch" : "observed"), candidates,
                  start_requested ? "start-requested" :
-                 (selection_applied ? "selection-applied" : "no-dispatch"));
+                 (selection_applied ? "selection-applied" :
+                  (batch && !batch_ready ? "awaiting-arrival-gate" : "no-dispatch")));
     std::fclose(status);
     chmod(dispatch_status_path, 0644);
+    FILE *diagnostics = std::fopen(dispatch_diagnostics_path, "w");
+    if (!diagnostics) return;
+    std::fprintf(diagnostics, "observed=%lld\texpeditions=%d\tfinish_nonzero=%d\tcandidates=%d\n",
+                 observed_ms, expedition_tasks, finished_expedition_tasks, candidates);
+    std::fprintf(diagnostics, "targets\tseed=%d\tfruit=%d\tgift=%d\tbloomed_poi=%d\tother=%d\n",
+                 direct_seed_targets, direct_fruit_targets, gift_targets, bloomed_poi_targets, other_targets);
+    for (const auto &entry : target_cases) {
+        const auto unfinished = unfinished_target_cases.find(entry.first);
+        std::fprintf(diagnostics, "target_case=%d\ttotal=%d\tfinish_zero=%d\n", entry.first,
+                     entry.second, unfinished == unfinished_target_cases.end() ? 0 : unfinished->second);
+    }
+    std::fclose(diagnostics);
+    chmod(dispatch_diagnostics_path, 0644);
 }
 
 void *hooked_complete_pikmin_task(void *self, void *task_id, bool discard_postcard, void *method_info) {
@@ -1662,15 +1741,63 @@ std::string read_return_mode() {
     return result.empty() ? "dry-run" : result;
 }
 
-// Dispatch remains fail-closed until the control centre explicitly writes
-// "armed".  The current development stage only publishes this state.
+// Dispatch remains fail-closed until the control centre explicitly writes a
+// recognised mode. "armed" is the original nearby one-shot mode; "batch"
+// additionally requires an exact task id plus a fresh arrival proof.
 std::string read_dispatch_mode() {
     FILE *file = std::fopen(dispatch_mode_path, "r");
     if (!file) return "off";
     char value[16]{};
     std::fgets(value, sizeof(value), file);
     std::fclose(file);
-    return std::strncmp(value, "armed", 5) == 0 ? "armed" : "off";
+    if (std::strncmp(value, "armed", 5) == 0) return "armed";
+    return std::strncmp(value, "batch", 5) == 0 ? "batch" : "off";
+}
+
+std::string read_dispatch_target() {
+    FILE *file = std::fopen(dispatch_target_path, "r");
+    if (!file) return {};
+    char value[256]{};
+    std::fgets(value, sizeof(value), file);
+    std::fclose(file);
+    std::string result(value);
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r' || result.back() == ' ')) result.pop_back();
+    return result;
+}
+
+bool dispatch_target_is_ready(const std::string &target_id, long long observed_ms) {
+    FILE *file = std::fopen(dispatch_ready_path, "r");
+    if (!file) return false;
+    char id[256]{};
+    long long ready_ms{};
+    const int fields = std::fscanf(file, "%255[^\t]\t%lld", id, &ready_ms);
+    std::fclose(file);
+    // A readiness proof is intentionally short-lived, so a stale file cannot
+    // arm an expedition after the joystick was moved elsewhere.
+    return fields == 2 && target_id == id && ready_ms > 0 &&
+           observed_ms >= ready_ms && observed_ms - ready_ms <= 30000;
+}
+
+void append_dispatch_history(const char *event, const char *kind, const std::string &task_id,
+                             int64_t duration_ms, int picked_count) {
+    const long long cutoff = now_ms() - 24LL * 60 * 60 * 1000;
+    const std::string temporary = std::string(dispatch_history_path) + ".tmp";
+    std::ifstream source(dispatch_history_path);
+    std::ofstream retained(temporary, std::ios::trunc);
+    std::string line;
+    while (source && std::getline(source, line)) {
+        char *end{};
+        const long long timestamp = std::strtoll(line.c_str(), &end, 10);
+        if (end != line.c_str() && timestamp >= cutoff) retained << line << '\n';
+    }
+    source.close(); retained.close();
+    if (std::rename(temporary.c_str(), dispatch_history_path) != 0) std::remove(temporary.c_str());
+    FILE *file = std::fopen(dispatch_history_path, "a");
+    if (!file) return;
+    std::fprintf(file, "%lld\t%s\t%s\t%s\t%" PRId64 "\t%d\n", now_ms(), event, kind,
+                 task_id.c_str(), duration_ms, picked_count);
+    std::fclose(file);
+    chmod(dispatch_history_path, 0644);
 }
 
 // The policy defaults to preserving postcards. Only the explicit "discard"
@@ -1910,6 +2037,10 @@ void start(const char *game_data_dir) {
     std::snprintf(dispatch_candidates_path, sizeof(dispatch_candidates_path), "%s/files/dispatch_candidates.tsv", game_data_dir);
     std::snprintf(dispatch_status_path, sizeof(dispatch_status_path), "%s/files/dispatch_probe_status.tsv", game_data_dir);
     std::snprintf(dispatch_mode_path, sizeof(dispatch_mode_path), "/data/local/tmp/pikmin-dispatch-mode.txt");
+    std::snprintf(dispatch_target_path, sizeof(dispatch_target_path), "/data/local/tmp/pikmin-dispatch-target.txt");
+    std::snprintf(dispatch_ready_path, sizeof(dispatch_ready_path), "/data/local/tmp/pikmin-dispatch-ready.tsv");
+    std::snprintf(dispatch_history_path, sizeof(dispatch_history_path), "%s/files/dispatch_history.tsv", game_data_dir);
+    std::snprintf(dispatch_diagnostics_path, sizeof(dispatch_diagnostics_path), "%s/files/dispatch_diagnostics.tsv", game_data_dir);
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);
