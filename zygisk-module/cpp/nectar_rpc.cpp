@@ -92,6 +92,7 @@ using GetTaskLong = int64_t (*)(void *, void *);
 using GetTaskDouble = double (*)(void *, void *);
 using GetTaskVariant = void *(*)(void *, void *);
 using GetTaskInt = int (*)(void *, void *);
+using GetExpeditionDurationMs = int64_t (*)(void *, void *);
 using PikminTaskPreparerConstructor = void (*)(void *, void *, void *, void *, void *);
 using PikminTaskActionManagerConstructor = void (*)(void *, void *);
 
@@ -188,6 +189,8 @@ GetTaskInt get_honey_num_balls{};
 GetTaskInt get_honey_type{};
 GetTaskInt get_honey_flower_kind{};
 GetTaskVariant get_honey_flower_kind_text{};
+GetTaskVariant get_expedition_item_key{};
+GetExpeditionDurationMs original_get_expedition_total_duration_ms{};
 PikminTaskPreparerConstructor original_pikmin_task_preparer_constructor{};
 PikminTaskActionManagerConstructor original_pikmin_task_action_manager_constructor{};
 TaskBool task_is_completed{};
@@ -224,6 +227,7 @@ long long last_claim_ms{};
 long long last_status_ms{};
 long long last_task_list_trace_ms{};
 long long last_return_dry_run_ms{};
+long long last_expedition_duration_observed_ms{};
 bool test_once_sent{};
 bool target_loaded{};
 bool return_one_dispatched{};
@@ -638,6 +642,22 @@ void hooked_pikmin_task_action_manager_constructor(void *self, void *method_info
     LOGI("[RETURN-DIAG] action manager captured self=%p", self);
 }
 
+// The picker evaluates this after selecting its fastest valid Pikmin.  By
+// observing it we can use the game's own round-trip calculation, rather than
+// converting map distance to a guessed travel time.  This hook is read-only.
+int64_t hooked_get_expedition_total_duration_ms(void *self, void *method_info) {
+    const int64_t duration = original_get_expedition_total_duration_ms
+            ? original_get_expedition_total_duration_ms(self, method_info) : 0;
+    const long long current = now_ms();
+    if (self && duration > 0 && current - last_expedition_duration_observed_ms >= 1000) {
+        last_expedition_duration_observed_ms = current;
+        void *key = get_expedition_item_key ? get_expedition_item_key(self, nullptr) : nullptr;
+        LOGI("[DISPATCH-OBSERVE] picker task=%s totalDurationMs=%" PRId64,
+             utf8_string(key).c_str(), duration);
+    }
+    return duration;
+}
+
 // Runs on the game's main update thread.  It asks the game's own readiness
 // predicate about each live inventory task and only writes diagnostics.
 void dry_run_return_tasks() {
@@ -862,6 +882,24 @@ void install_return_diagnostic_hook() {
     }
     get_pikmin_task_proto = reinterpret_cast<GetPikminTaskProto>(proto_entry);
     get_task_finish_time_ms = reinterpret_cast<GetTaskFinishTimeMs>(finish_entry);
+    void *expedition_item_class = find_class("Niantic.Ichigo.Game.Expedition", "ExpeditionItemData");
+    void *expedition_key_method = expedition_item_class
+            ? class_get_method_from_name(expedition_item_class, "get_Key", 0) : nullptr;
+    void *expedition_duration_method = expedition_item_class
+            ? class_get_method_from_name(expedition_item_class, "get_TotalDurationMs", 0) : nullptr;
+    void *expedition_duration_entry = expedition_duration_method
+            ? *reinterpret_cast<void **>(expedition_duration_method) : nullptr;
+    get_expedition_item_key = expedition_key_method
+            ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(expedition_key_method)) : nullptr;
+    if (expedition_duration_entry) {
+        A64HookFunction(expedition_duration_entry,
+                        reinterpret_cast<void *>(hooked_get_expedition_total_duration_ms),
+                        reinterpret_cast<void **>(&original_get_expedition_total_duration_ms));
+        LOGI("[DISPATCH-OBSERVE] duration hook installed method=%p entry=%p",
+             expedition_duration_method, expedition_duration_entry);
+    } else {
+        LOGE("[DISPATCH-OBSERVE] ExpeditionItemData.TotalDurationMs not found");
+    }
     void *task_case = proto_class ? class_get_method_from_name(proto_class, "get_TaskCase", 0) : nullptr;
     get_task_case = task_case ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(task_case)) : nullptr;
     void *carry = proto_class ? class_get_method_from_name(proto_class, "get_Carry", 0) : nullptr;
