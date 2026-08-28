@@ -220,6 +220,8 @@ char return_batch_limit_path[512]{};
 char compatibility_path[512]{};
 char dispatch_candidates_path[512]{};
 char dispatch_status_path[512]{};
+std::string observed_expedition_task_id;
+int64_t observed_expedition_duration_ms{};
 std::map<std::string, FlowerRecord> flowers;
 std::map<std::string, std::string> last_flower_state;
 long long last_tick_ms{};
@@ -545,9 +547,11 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         const double longitude = point && get_point_lng_degrees ? get_point_lng_degrees(point, nullptr) : 0.0;
         const double distance = has_current_location && (latitude != 0.0 || longitude != 0.0)
                 ? distance_metres(current_latitude, current_longitude, latitude, longitude) : -1.0;
-        std::fprintf(file, "%lld\t%s\t%s\t0\t%" PRId64 "\t%.7f\t%.7f\tpending-travel-estimate\t%.1f\n", observed_ms,
+        const int64_t game_duration = utf8_string(id) == observed_expedition_task_id
+                ? observed_expedition_duration_ms : 0;
+        std::fprintf(file, "%lld\t%s\t%s\t0\t%" PRId64 "\t%.7f\t%.7f\tpending-travel-estimate\t%.1f\t%" PRId64 "\n", observed_ms,
                      target_case == 9 ? "seed" : "fruit", utf8_string(id).c_str(),
-                     expiration_ms, latitude, longitude, distance);
+                     expiration_ms, latitude, longitude, distance, game_duration);
         ++candidates;
     }
     std::fclose(file);
@@ -652,8 +656,10 @@ int64_t hooked_get_expedition_total_duration_ms(void *self, void *method_info) {
     if (self && duration > 0 && current - last_expedition_duration_observed_ms >= 1000) {
         last_expedition_duration_observed_ms = current;
         void *key = get_expedition_item_key ? get_expedition_item_key(self, nullptr) : nullptr;
+        observed_expedition_task_id = utf8_string(key);
+        observed_expedition_duration_ms = duration;
         LOGI("[DISPATCH-OBSERVE] picker task=%s totalDurationMs=%" PRId64,
-             utf8_string(key).c_str(), duration);
+             observed_expedition_task_id.c_str(), duration);
     }
     return duration;
 }
