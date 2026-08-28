@@ -1,4 +1,5 @@
 #include "hack.h"
+#include "gps_copy.h"
 #include "log.h"
 #include "xdl.h"
 #include "And64InlineHook.hpp"
@@ -1492,7 +1493,7 @@ void install_hook(uintptr_t base, uintptr_t rva, void *replacement, T &original)
                     reinterpret_cast<void **>(&original));
 }
 
-void start(const char *game_data_dir) {
+void start(const char *game_data_dir, JavaVM *vm) {
     void *handle{};
     for (int attempt = 0; attempt < 120 && !handle; ++attempt) {
         handle = xdl_open("libil2cpp.so", XDL_DEFAULT);
@@ -1560,12 +1561,13 @@ void start(const char *game_data_dir) {
     install_hook(base, kPlantingStateUpdatedRva, reinterpret_cast<void *>(hooked_planting_state_updated), original_planting_state_updated);
     install_hook(base, kLocationControllerAwakeRva, reinterpret_cast<void *>(hooked_location_controller_awake), original_location_controller_awake);
     install_return_diagnostic_hook();
+    gps_copy_prepare(base, game_data_dir, vm);
     LOGI("[NECTAR] v152 RPC hooks installed base=%" PRIxPTR " mode=%s", base, mode_path);
 }
 
 }  // namespace
 
-void hack_prepare(const char *game_data_dir, void *, size_t) {
-    std::thread worker(start, game_data_dir);
+void hack_prepare(const char *game_data_dir, void *, size_t, JavaVM *vm) {
+    std::thread worker(start, game_data_dir, vm);
     worker.detach();
 }
