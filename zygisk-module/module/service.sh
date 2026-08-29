@@ -25,7 +25,7 @@ PUBLIC_RETURN_HISTORY="$MODDIR/return_reward_history.tsv"
 GAME_CLAIMS="$GAME_FILES/nectar_claims.tsv"
 PUBLIC_CLAIMS="$MODDIR/nectar_claims.tsv"
 
-[ -f "$CONTROL_MODE" ] || printf 'diag\n' >"$CONTROL_MODE"
+[ -f "$CONTROL_MODE" ] || printf 'auto\n' >"$CONTROL_MODE"
 [ -f "$RETURN_CONTROL_MODE" ] || printf 'dry-run\n' >"$RETURN_CONTROL_MODE"
 [ -f "$RETURN_POSTCARD_POLICY" ] || printf 'keep\n' >"$RETURN_POSTCARD_POLICY"
 [ -f "$RETURN_BATCH_LIMIT" ] || printf '5\n' >"$RETURN_BATCH_LIMIT"
