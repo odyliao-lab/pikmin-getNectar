@@ -800,7 +800,16 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         // exact task and prove a fresh five-second arrival gate before any game
         // API is invoked. The native side rechecks the live game location.
         const bool requested = armed || (batch_ready && id_text == batch_target);
-        const double allowed_distance = batch ? 25.0 : 1000.0;
+        // Control Center's own arrival gate already requires this same
+        // distance column within 4 m (agreeing with the provider) for two
+        // consecutive fresh scans before it ever authorises a batch dispatch,
+        // so 4 m here does not reject anything the controller would not have
+        // rejected itself -- it just makes the native side fail closed on
+        // distance too, instead of trusting the controller's word for it.
+        // Only trustworthy since current_location() now fails closed on a
+        // stale fallback file (see kSystemGpsMaxAgeSeconds); at the old 25 m
+        // this same reading was once 111 m wrong for over an hour.
+        const double allowed_distance = batch ? 4.0 : 1000.0;
         if (dispatch_confirmation_pending_id.empty() && requested && !selection_applied && data && picked &&
             picked_count > 0 && set_expedition_pikmins &&
             distance >= 0.0 && distance <= allowed_distance) {
