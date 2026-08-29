@@ -84,7 +84,10 @@ chmod 0644 "$RETURN_BATCH_LIMIT"
     fi
     # Reward history is an operator log, not an archive. Keep one rolling day
     # in both namespaces so the controller never accumulates unbounded rows.
-    RETURN_CUTOFF="$(($(date +%s) * 1000 - 86400000))"
+    # This device's shell does 32-bit arithmetic, so a plain "seconds * 1000"
+    # overflows and wraps to a small number, which keeps every row forever.
+    # Do the millisecond maths in awk instead.
+    RETURN_CUTOFF="$(awk -v s="$(date +%s)" 'BEGIN { printf "%.0f", (s - 86400) * 1000 }')"
     for RETURN_LOG in "$GAME_RETURN_HISTORY" "$PUBLIC_RETURN_HISTORY"; do
       [ -f "$RETURN_LOG" ] || continue
       awk -F '\t' -v cutoff="$RETURN_CUTOFF" '$1 >= cutoff' "$RETURN_LOG" >"$RETURN_LOG.tmp" 2>/dev/null &&

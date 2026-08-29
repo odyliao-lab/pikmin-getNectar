@@ -236,6 +236,10 @@ char target_path[512]{};
 char status_path[512]{};
 char claim_log_path[512]{};
 char system_gps_path[512]{};
+// service.sh rewrites the system GPS file every two seconds, so anything older
+// than this means its loop is not running and the contents cannot be trusted.
+constexpr long long kSystemGpsMaxAgeSeconds = 15;
+long long last_stale_gps_age_logged = -1;
 char return_trace_path[512]{};
 char return_history_path[512]{};
 char return_mode_path[512]{};
@@ -1501,8 +1505,26 @@ bool current_location(double &latitude, double &longitude) {
             return true;
         }
     }
-    // The Magisk service writes the currently active system location here.
-    // It is used only when the version-specific in-memory layout is unknown.
+    // The Magisk service rewrites this file every two seconds; it is used only
+    // when the version-specific in-memory layout is unknown.  Refuse a stale
+    // one: on 2026-08-29 a CRLF service.sh never started its loop, so this file
+    // sat unchanged for over an hour and pinned the reported position ~90 m
+    // from the player.  Distance gates then passed or failed on a location that
+    // had not been true for hours, which is exactly the kind of silent wrong
+    // answer this module must not give.  Without a fresh fix, fail closed and
+    // let the caller treat the distance as unknown.
+    struct stat gps_stat {};
+    if (::stat(system_gps_path, &gps_stat) != 0) return false;
+    const long long age_seconds =
+            static_cast<long long>(time(nullptr)) - static_cast<long long>(gps_stat.st_mtime);
+    if (age_seconds < 0 || age_seconds > kSystemGpsMaxAgeSeconds) {
+        if (age_seconds != last_stale_gps_age_logged) {
+            last_stale_gps_age_logged = age_seconds;
+            LOGW("[GPS] ignoring stale %s (%lld s old); is service.sh running?",
+                 system_gps_path, age_seconds);
+        }
+        return false;
+    }
     FILE *fallback = std::fopen(system_gps_path, "r");
     if (!fallback) return false;
     const int read = std::fscanf(fallback, "%lf\t%lf", &latitude, &longitude);

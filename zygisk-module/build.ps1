@@ -29,17 +29,13 @@ Copy-Item -LiteralPath (Join-Path $build 'libpikmin_nectar_rpc.so') `
 
 $zip = Join-Path $root 'pikmin-nectar-rpc-v152.zip'
 if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force }
-# Magisk/Kitsune requires POSIX-style entry names (zygisk/arm64-v8a.so).
-# Windows tar.exe uses an archive dialect its installer rejects, while
-# Compress-Archive writes Windows backslashes.  The JDK jar tool produces a
-# conventional deflated ZIP with portable forward-slash entry names.
-$jar = (Get-Command jar -ErrorAction Stop).Source
-Push-Location $module
-try {
-    & $jar --create --file $zip META-INF module.prop service.sh zygisk
-    if ($LASTEXITCODE -ne 0) { throw 'Module packaging failed.' }
-}
-finally {
-    Pop-Location
-}
+# Magisk/Kitsune requires POSIX-style entry names (zygisk/arm64-v8a.so), LF
+# line endings, and an executable service.sh.  Windows tar.exe uses an archive
+# dialect the installer rejects and Compress-Archive writes backslashes; the
+# JDK jar tool is often absent and preserves neither line endings nor modes.
+# package.py guarantees all four, which matters because a CRLF service.sh
+# silently fails every line and its background loop never runs.
+$python = (Get-Command python -ErrorAction Stop).Source
+& $python (Join-Path $root 'package.py') $zip
+if ($LASTEXITCODE -ne 0) { throw 'Module packaging failed.' }
 Get-Item -LiteralPath $zip | Select-Object FullName, Length

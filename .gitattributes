@@ -1,0 +1,8 @@
+# The Magisk module ships these files verbatim to an Android device, where a
+# CRLF line ending makes the shell read every path with a trailing \r and the
+# whole script fails.  Force LF in the working tree too, so packaging from a
+# Windows checkout (core.autocrlf=true) cannot produce a broken module.
+*.sh text eol=lf
+zygisk-module/module/module.prop text eol=lf
+zygisk-module/module/META-INF/com/google/android/update-binary text eol=lf
+zygisk-module/module/META-INF/com/google/android/updater-script text eol=lf
