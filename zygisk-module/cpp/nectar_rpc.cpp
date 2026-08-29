@@ -665,33 +665,6 @@ void *picked_pikmin_ids_array(void *enumerable) {
     return array;
 }
 
-// Read-only lookup: find the inventory object whose own Id matches the Gift
-// task's designated PikminId. It never mutates the collection or invokes any
-// game action.
-void *find_pikmin_item_by_id(void *enumerable, const std::string &wanted_id) {
-    if (!enumerable || wanted_id.empty() || !object_get_class || !class_get_method_from_name ||
-        !object_get_virtual_method || !get_inventory_item_id) return nullptr;
-    void *ienumerable = find_class("System.Collections", "IEnumerable");
-    void *ienumerator = find_class("System.Collections", "IEnumerator");
-    void *get_method = ienumerable ? class_get_method_from_name(ienumerable, "GetEnumerator", 0) : nullptr;
-    void *move_method = ienumerator ? class_get_method_from_name(ienumerator, "MoveNext", 0) : nullptr;
-    void *current_method = ienumerator ? class_get_method_from_name(ienumerator, "get_Current", 0) : nullptr;
-    void *klass = object_get_class(enumerable);
-    void *get_impl = get_method ? object_get_virtual_method(enumerable, get_method) : nullptr;
-    auto get_enumerator = reinterpret_cast<GetEnumerable>(get_impl ? *reinterpret_cast<void **>(get_impl) : nullptr);
-    void *iterator = get_enumerator ? get_enumerator(enumerable, nullptr) : nullptr;
-    void *move_impl = move_method && iterator ? object_get_virtual_method(iterator, move_method) : nullptr;
-    void *current_impl = current_method && iterator ? object_get_virtual_method(iterator, current_method) : nullptr;
-    auto move_next = reinterpret_cast<EnumeratorMoveNext>(move_impl ? *reinterpret_cast<void **>(move_impl) : nullptr);
-    auto current = reinterpret_cast<EnumeratorCurrent>(current_impl ? *reinterpret_cast<void **>(current_impl) : nullptr);
-    if (!iterator || !move_next || !current) return nullptr;
-    for (int index = 0; index < 1000 && move_next(iterator, nullptr); ++index) {
-        void *item = current(iterator, nullptr);
-        if (item && utf8_string(get_inventory_item_id(item, nullptr)) == wanted_id) return item;
-    }
-    return nullptr;
-}
-
 void log_dispatch_enumerable_metadata(void *object, const char *label) {
     if (!object || !object_get_class || !class_get_methods || !method_get_name || dispatch_enumerable_metadata_logged) return;
     dispatch_enumerable_metadata_logged = true;
@@ -763,8 +736,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
             else ++other_targets;
         }
         // The visible fruit list contains both direct Fruit targets and
-        // BloomedPoi targets whose reward is a fruit collection. Gifts remain
-        // deliberately excluded until their own native start path is proven.
+        // BloomedPoi targets whose reward is a fruit collection.
         const char *kind = seed_target ? "seed" : (fruit_target || bloomed_poi_target ? "fruit" : (gift_target ? "gift" : nullptr));
         if (!task || !expedition || !kind) continue;
         void *id = get_inventory_item_id ? get_inventory_item_id(task, nullptr) : nullptr;
@@ -798,6 +770,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         bool can_start = data && get_expedition_can_try_start
                 ? get_expedition_can_try_start(data, nullptr) : false;
         if (game_duration <= 0 && id_text == observed_expedition_task_id) game_duration = observed_expedition_duration_ms;
+        const bool is_gift = std::strcmp(kind, "gift") == 0;
         void *utils = data ? *reinterpret_cast<void **>(static_cast<uint8_t *>(data) + 0x48) : nullptr;
         void *scope = data ? *reinterpret_cast<void **>(static_cast<uint8_t *>(data) + 0x98) : nullptr;
         void *pikmins = return_inventory_manager && get_pikmin_item_collection
@@ -805,37 +778,18 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         void *picked = utils && pick_fastest_pikmins && pikmins && scope
                 ? pick_fastest_pikmins(utils, data, pikmins, scope, nullptr) : nullptr;
         log_dispatch_enumerable_metadata(picked ? picked : pikmins, picked ? "picked" : "pikminCollection");
-        const int picked_count = count_enumerable_items(picked);
-        const bool gift_pikmin_unavailable = std::strcmp(kind, "gift") == 0 &&
-                (!picked || picked_count <= 0 || game_duration <= 0 ||
-                 game_duration > 5 * 60 * 1000 || !can_start);
-        if (batch_ready && id_text == batch_target && std::strcmp(kind, "gift") == 0) {
+        int picked_count = count_enumerable_items(picked);
+        bool gift_pikmin_unavailable = is_gift && (!picked || picked_count <= 0);
+        if (batch_ready && id_text == batch_target && is_gift) {
             if (gift_target && !gift_target_metadata_logged && object_get_class) {
                 gift_target_metadata_logged = true;
                 log_class_methods("GiftTarget", object_get_class(gift_target));
             }
-            const std::string gift_pikmin_id = get_task_pikmin_id
-                    ? utf8_string(get_task_pikmin_id(proto, nullptr)) : "";
-            void *gift_pikmin = find_pikmin_item_by_id(pikmins, gift_pikmin_id);
             LOGI("[GIFT-DIAG] task=%s player=%.7f,%.7f spawn=%.7f,%.7f finish=%.7f,%.7f duration=%" PRId64 " canStart=%d picked=%d",
                  id_text.c_str(), current_latitude, current_longitude, latitude, longitude,
                  finish_latitude, finish_longitude, game_duration, can_start ? 1 : 0, picked_count);
-            LOGI("[GIFT-DIAG] task=%s designatedPikmin=%s inventoryItem=%p",
-                 id_text.c_str(), gift_pikmin_id.c_str(), gift_pikmin);
-            if (gift_pikmin && !gift_pikmin_metadata_logged && object_get_class) {
-                gift_pikmin_metadata_logged = true;
-                log_class_methods("GiftDesignatedPikmin", object_get_class(gift_pikmin));
-            }
-        }
-        // Gifts may have exactly one eligible Pikmin. The game's own picker is
-        // and CanTryStart predicate are the authority. A selected Pikmin can
-        // still be unavailable (for example it is on a mushroom). Record one
-        // controller-visible skip instead of forcing a different team.
-        if (batch_ready && id_text == batch_target && std::strcmp(kind, "gift") == 0 &&
-            gift_pikmin_unavailable &&
-            dispatch_last_gift_skip_id != id_text) {
-            append_dispatch_history("gift-pikmin-unavailable", kind, id_text, game_duration, picked_count);
-            dispatch_last_gift_skip_id = id_text;
+            LOGI("[GIFT-DIAG] task=%s gamePickerCount=%d; eligibility delegated to ExpeditionItemData.Allows",
+                 id_text.c_str(), picked_count);
         }
         // Phase two: when armed, update exactly one nearby task with the
         // game's own fastest team.  This still does not start an expedition;
@@ -847,9 +801,13 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         // API is invoked. The native side rechecks the live game location.
         const bool requested = armed || (batch_ready && id_text == batch_target);
         const double allowed_distance = batch ? 25.0 : 1000.0;
-        if (dispatch_confirmation_pending_id.empty() && requested && !selection_applied && data && picked && set_expedition_pikmins &&
-            !(batch_ready && id_text == batch_target && gift_pikmin_unavailable) &&
+        if (dispatch_confirmation_pending_id.empty() && requested && !selection_applied && data && picked &&
+            picked_count > 0 && set_expedition_pikmins &&
             distance >= 0.0 && distance <= allowed_distance) {
+            // The picker calls ExpeditionItemData.Allows for every candidate.
+            // For ordinary gifts that enforces Restriction.AllowedPikminId;
+            // for rare-deco gifts it enforces AllowsRareDecoGift. Never
+            // substitute a controller-chosen Pikmin.
             void *ids = picked_pikmin_ids_array(picked);
             if (ids) {
                 set_expedition_pikmins(data, ids, nullptr);
@@ -860,6 +818,8 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 selection_applied = true;
                 LOGI("[DISPATCH-OBSERVE] armed selection task=%s duration=%" PRId64 " canStart=%d picked=%d",
                      id_text.c_str(), game_duration, can_start ? 1 : 0, picked_count);
+                gift_pikmin_unavailable = is_gift &&
+                        (game_duration <= 0 || game_duration > 5 * 60 * 1000 || !can_start);
                 if (game_duration > 0 && game_duration <= 5 * 60 * 1000 && can_start && start_expedition) {
                     void *start_result = start_expedition(data, nullptr);
                     const bool can_start_after = get_expedition_can_try_start
@@ -880,8 +840,20 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                     LOGI("[DISPATCH] start requested task=%s duration=%" PRId64 " picked=%d result=%p canStartAfter=%d finishAfter=%" PRId64,
                          id_text.c_str(), game_duration, picked_count, start_result,
                          can_start_after ? 1 : 0, finish_after);
+                } else if (batch_ready && id_text == batch_target && gift_pikmin_unavailable &&
+                           dispatch_last_gift_skip_id != id_text) {
+                    // The designated ID exists, but the game rejected it (for
+                    // example that Pikmin is busy). Never substitute another.
+                    append_dispatch_history("gift-pikmin-unavailable", kind, id_text,
+                                            game_duration, picked_count);
+                    dispatch_last_gift_skip_id = id_text;
                 }
             }
+        } else if (batch_ready && id_text == batch_target && gift_pikmin_unavailable &&
+                   dispatch_last_gift_skip_id != id_text) {
+            append_dispatch_history("gift-pikmin-unavailable", kind, id_text,
+                                    game_duration, picked_count);
+            dispatch_last_gift_skip_id = id_text;
         }
         std::fprintf(file, "%lld\t%s\t%s\t0\t%" PRId64 "\t%.7f\t%.7f\tpending-travel-estimate\t%.1f\t%" PRId64 "\t%d\t%d\n", observed_ms,
                      kind, id_text.c_str(),
