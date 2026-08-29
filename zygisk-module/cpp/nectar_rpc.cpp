@@ -163,6 +163,8 @@ GetInventoryItemId get_inventory_item_id{};
 GetPikminTaskList original_get_pikmin_task_list{};
 GetPikminTaskProto get_pikmin_task_proto{};
 GetTaskFinishTimeMs get_task_finish_time_ms{};
+GetTaskVariant get_task_finish_location{};
+GetTaskVariant get_task_pikmin_id{};
 GetTaskVariant get_task_carry{};
 GetTaskVariant get_task_expedition{};
 GetTaskVariant get_task_gift{};
@@ -249,6 +251,8 @@ char dispatch_ready_path[512]{};
 char dispatch_history_path[512]{};
 char dispatch_diagnostics_path[512]{};
 std::string dispatch_confirmation_pending_id;
+long long dispatch_confirmation_started_observed_ms{};
+std::string dispatch_last_gift_skip_id;
 std::string observed_expedition_task_id;
 int64_t observed_expedition_duration_ms{};
 std::map<std::string, FlowerRecord> flowers;
@@ -279,6 +283,8 @@ bool return_bloomed_poi_reward_metadata_logged{};
 bool return_bloomed_poi_fruit_metadata_logged{};
 bool return_bloomed_poi_fruit_entry_metadata_logged{};
 bool dispatch_enumerable_metadata_logged{};
+bool gift_pikmin_metadata_logged{};
+bool gift_target_metadata_logged{};
 void *pending_task{};
 uint32_t pending_task_handle{};
 std::string pending_id;
@@ -297,6 +303,7 @@ std::string read_dispatch_target();
 bool dispatch_target_is_ready(const std::string &target_id, long long observed_ms);
 void append_dispatch_history(const char *event, const char *kind, const std::string &task_id,
                              int64_t duration_ms, int picked_count);
+void log_class_methods(const char *label, void *proto_class);
 
 std::string utf8_string(void *value) {
     if (!value) return {};
@@ -644,6 +651,33 @@ void *picked_pikmin_ids_array(void *enumerable) {
     return array;
 }
 
+// Read-only lookup: find the inventory object whose own Id matches the Gift
+// task's designated PikminId. It never mutates the collection or invokes any
+// game action.
+void *find_pikmin_item_by_id(void *enumerable, const std::string &wanted_id) {
+    if (!enumerable || wanted_id.empty() || !object_get_class || !class_get_method_from_name ||
+        !object_get_virtual_method || !get_inventory_item_id) return nullptr;
+    void *ienumerable = find_class("System.Collections", "IEnumerable");
+    void *ienumerator = find_class("System.Collections", "IEnumerator");
+    void *get_method = ienumerable ? class_get_method_from_name(ienumerable, "GetEnumerator", 0) : nullptr;
+    void *move_method = ienumerator ? class_get_method_from_name(ienumerator, "MoveNext", 0) : nullptr;
+    void *current_method = ienumerator ? class_get_method_from_name(ienumerator, "get_Current", 0) : nullptr;
+    void *klass = object_get_class(enumerable);
+    void *get_impl = get_method ? object_get_virtual_method(enumerable, get_method) : nullptr;
+    auto get_enumerator = reinterpret_cast<GetEnumerable>(get_impl ? *reinterpret_cast<void **>(get_impl) : nullptr);
+    void *iterator = get_enumerator ? get_enumerator(enumerable, nullptr) : nullptr;
+    void *move_impl = move_method && iterator ? object_get_virtual_method(iterator, move_method) : nullptr;
+    void *current_impl = current_method && iterator ? object_get_virtual_method(iterator, current_method) : nullptr;
+    auto move_next = reinterpret_cast<EnumeratorMoveNext>(move_impl ? *reinterpret_cast<void **>(move_impl) : nullptr);
+    auto current = reinterpret_cast<EnumeratorCurrent>(current_impl ? *reinterpret_cast<void **>(current_impl) : nullptr);
+    if (!iterator || !move_next || !current) return nullptr;
+    for (int index = 0; index < 1000 && move_next(iterator, nullptr); ++index) {
+        void *item = current(iterator, nullptr);
+        if (item && utf8_string(get_inventory_item_id(item, nullptr)) == wanted_id) return item;
+    }
+    return nullptr;
+}
+
 void log_dispatch_enumerable_metadata(void *object, const char *label) {
     if (!object || !object_get_class || !class_get_methods || !method_get_name || dispatch_enumerable_metadata_logged) return;
     dispatch_enumerable_metadata_logged = true;
@@ -672,9 +706,18 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     const std::string dispatch_mode = read_dispatch_mode();
     const bool armed = dispatch_mode == "armed";
     const bool batch = dispatch_mode == "batch";
+    // A controller stop is an explicit safety release.  Do not let a failed
+    // or timed-out prior batch leave an in-memory confirmation lock that
+    // blocks every later, independently armed batch.
+    if (!armed && !batch && !dispatch_confirmation_pending_id.empty()) {
+        dispatch_confirmation_pending_id.clear();
+        dispatch_confirmation_started_observed_ms = 0;
+    }
     const std::string batch_target = batch ? read_dispatch_target() : "";
     const bool batch_ready = batch && !batch_target.empty() &&
             dispatch_target_is_ready(batch_target, observed_ms);
+    const bool confirmation_due = !dispatch_confirmation_pending_id.empty() &&
+            dispatch_confirmation_started_observed_ms < observed_ms;
     int candidates{};
     int expedition_tasks{};
     int finished_expedition_tasks{};
@@ -693,6 +736,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         void *seed_target = expedition && get_expedition_seed ? get_expedition_seed(expedition, nullptr) : nullptr;
         void *fruit_target = expedition && get_expedition_fruit ? get_expedition_fruit(expedition, nullptr) : nullptr;
         void *bloomed_poi_target = expedition && get_expedition_bloomed_poi ? get_expedition_bloomed_poi(expedition, nullptr) : nullptr;
+        void *gift_target = expedition && get_expedition_gift ? get_expedition_gift(expedition, nullptr) : nullptr;
         if (expedition) {
             ++expedition_tasks;
             ++target_cases[target_case];
@@ -707,16 +751,17 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         // The visible fruit list contains both direct Fruit targets and
         // BloomedPoi targets whose reward is a fruit collection. Gifts remain
         // deliberately excluded until their own native start path is proven.
-        const char *kind = seed_target ? "seed" : (fruit_target || bloomed_poi_target ? "fruit" : nullptr);
+        const char *kind = seed_target ? "seed" : (fruit_target || bloomed_poi_target ? "fruit" : (gift_target ? "gift" : nullptr));
         if (!task || !expedition || !kind) continue;
         void *id = get_inventory_item_id ? get_inventory_item_id(task, nullptr) : nullptr;
         const std::string id_text = utf8_string(id);
-        if (!dispatch_confirmation_pending_id.empty() && id_text == dispatch_confirmation_pending_id)
+        if (confirmation_due && id_text == dispatch_confirmation_pending_id)
             pending_confirmation_seen = true;
         if (finish_ms != 0) {
-            if (!dispatch_confirmation_pending_id.empty() && id_text == dispatch_confirmation_pending_id) {
+            if (confirmation_due && id_text == dispatch_confirmation_pending_id) {
                 append_dispatch_history("inventory-confirmed", kind, id_text, 0, 0);
                 dispatch_confirmation_pending_id.clear();
+                dispatch_confirmation_started_observed_ms = 0;
             }
             continue;
         }
@@ -725,6 +770,11 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         void *point = get_expedition_spawn_point ? get_expedition_spawn_point(expedition, nullptr) : nullptr;
         const double latitude = point && get_point_lat_degrees ? get_point_lat_degrees(point, nullptr) : 0.0;
         const double longitude = point && get_point_lng_degrees ? get_point_lng_degrees(point, nullptr) : 0.0;
+        void *finish_point = proto && get_task_finish_location ? get_task_finish_location(proto, nullptr) : nullptr;
+        const double finish_latitude = finish_point && get_point_lat_degrees
+                ? get_point_lat_degrees(finish_point, nullptr) : 0.0;
+        const double finish_longitude = finish_point && get_point_lng_degrees
+                ? get_point_lng_degrees(finish_point, nullptr) : 0.0;
         const double distance = has_current_location && (latitude != 0.0 || longitude != 0.0)
                 ? distance_metres(current_latitude, current_longitude, latitude, longitude) : -1.0;
         void *data = expedition_data_store && get_expedition_data_by_index
@@ -742,6 +792,37 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 ? pick_fastest_pikmins(utils, data, pikmins, scope, nullptr) : nullptr;
         log_dispatch_enumerable_metadata(picked ? picked : pikmins, picked ? "picked" : "pikminCollection");
         const int picked_count = count_enumerable_items(picked);
+        const bool gift_pikmin_unavailable = std::strcmp(kind, "gift") == 0 &&
+                (!picked || picked_count <= 0 || game_duration <= 0 ||
+                 game_duration > 5 * 60 * 1000 || !can_start);
+        if (batch_ready && id_text == batch_target && std::strcmp(kind, "gift") == 0) {
+            if (gift_target && !gift_target_metadata_logged && object_get_class) {
+                gift_target_metadata_logged = true;
+                log_class_methods("GiftTarget", object_get_class(gift_target));
+            }
+            const std::string gift_pikmin_id = get_task_pikmin_id
+                    ? utf8_string(get_task_pikmin_id(proto, nullptr)) : "";
+            void *gift_pikmin = find_pikmin_item_by_id(pikmins, gift_pikmin_id);
+            LOGI("[GIFT-DIAG] task=%s player=%.7f,%.7f spawn=%.7f,%.7f finish=%.7f,%.7f duration=%" PRId64 " canStart=%d picked=%d",
+                 id_text.c_str(), current_latitude, current_longitude, latitude, longitude,
+                 finish_latitude, finish_longitude, game_duration, can_start ? 1 : 0, picked_count);
+            LOGI("[GIFT-DIAG] task=%s designatedPikmin=%s inventoryItem=%p",
+                 id_text.c_str(), gift_pikmin_id.c_str(), gift_pikmin);
+            if (gift_pikmin && !gift_pikmin_metadata_logged && object_get_class) {
+                gift_pikmin_metadata_logged = true;
+                log_class_methods("GiftDesignatedPikmin", object_get_class(gift_pikmin));
+            }
+        }
+        // Gifts may have exactly one eligible Pikmin. The game's own picker is
+        // and CanTryStart predicate are the authority. A selected Pikmin can
+        // still be unavailable (for example it is on a mushroom). Record one
+        // controller-visible skip instead of forcing a different team.
+        if (batch_ready && id_text == batch_target && std::strcmp(kind, "gift") == 0 &&
+            gift_pikmin_unavailable &&
+            dispatch_last_gift_skip_id != id_text) {
+            append_dispatch_history("gift-pikmin-unavailable", kind, id_text, game_duration, picked_count);
+            dispatch_last_gift_skip_id = id_text;
+        }
         // Phase two: when armed, update exactly one nearby task with the
         // game's own fastest team.  This still does not start an expedition;
         // it establishes the real duration and CanTryStart state that the
@@ -752,7 +833,8 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         // API is invoked. The native side rechecks the live game location.
         const bool requested = armed || (batch_ready && id_text == batch_target);
         const double allowed_distance = batch ? 25.0 : 1000.0;
-        if (requested && !selection_applied && data && picked && set_expedition_pikmins &&
+        if (dispatch_confirmation_pending_id.empty() && requested && !selection_applied && data && picked && set_expedition_pikmins &&
+            !(batch_ready && id_text == batch_target && gift_pikmin_unavailable) &&
             distance >= 0.0 && distance <= allowed_distance) {
             void *ids = picked_pikmin_ids_array(picked);
             if (ids) {
@@ -765,12 +847,18 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 LOGI("[DISPATCH-OBSERVE] armed selection task=%s duration=%" PRId64 " canStart=%d picked=%d",
                      id_text.c_str(), game_duration, can_start ? 1 : 0, picked_count);
                 if (game_duration > 0 && game_duration <= 5 * 60 * 1000 && can_start && start_expedition) {
-                    start_expedition(data, nullptr);
+                    void *start_result = start_expedition(data, nullptr);
+                    const bool can_start_after = get_expedition_can_try_start
+                            ? get_expedition_can_try_start(data, nullptr) : false;
+                    const int64_t finish_after = get_task_finish_time_ms
+                            ? get_task_finish_time_ms(task, nullptr) : 0;
                     start_requested = true;
                     dispatch_confirmation_pending_id = id_text;
+                    dispatch_confirmation_started_observed_ms = observed_ms;
                     append_dispatch_history("start-requested", kind, id_text, game_duration, picked_count);
-                    LOGI("[DISPATCH] start requested task=%s duration=%" PRId64 " picked=%d",
-                         id_text.c_str(), game_duration, picked_count);
+                    LOGI("[DISPATCH] start requested task=%s duration=%" PRId64 " picked=%d result=%p canStartAfter=%d finishAfter=%" PRId64,
+                         id_text.c_str(), game_duration, picked_count, start_result,
+                         can_start_after ? 1 : 0, finish_after);
                 }
             }
         }
@@ -783,10 +871,11 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     // just submitted is absent from a later complete projection, record that
     // separately from the request rather than pretending the async call alone
     // was confirmation.
-    if (!dispatch_confirmation_pending_id.empty() && !pending_confirmation_seen) {
+    if (confirmation_due && !dispatch_confirmation_pending_id.empty() && !pending_confirmation_seen) {
         append_dispatch_history("inventory-confirmed-absent", "unknown",
                                 dispatch_confirmation_pending_id, 0, 0);
         dispatch_confirmation_pending_id.clear();
+        dispatch_confirmation_started_observed_ms = 0;
     }
     std::fclose(file);
     chmod(dispatch_candidates_path, 0644);
@@ -1150,6 +1239,14 @@ void install_return_diagnostic_hook() {
     }
     get_pikmin_task_proto = reinterpret_cast<GetPikminTaskProto>(proto_entry);
     get_task_finish_time_ms = reinterpret_cast<GetTaskFinishTimeMs>(finish_entry);
+    void *finish_location_method = proto_class
+            ? class_get_method_from_name(proto_class, "get_FinishLocation", 0) : nullptr;
+    get_task_finish_location = finish_location_method
+            ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(finish_location_method)) : nullptr;
+    void *task_pikmin_id_method = proto_class
+            ? class_get_method_from_name(proto_class, "get_PikminId", 0) : nullptr;
+    get_task_pikmin_id = task_pikmin_id_method
+            ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(task_pikmin_id_method)) : nullptr;
     void *expedition_item_class = find_class("Niantic.Ichigo.Game.Expedition.Data", "ExpeditionItemData");
     void *expedition_key_method = expedition_item_class
             ? class_get_method_from_name(expedition_item_class, "get_Key", 0) : nullptr;
