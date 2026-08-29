@@ -257,6 +257,16 @@ char dispatch_diagnostics_path[512]{};
 std::string dispatch_confirmation_pending_id;
 long long dispatch_confirmation_started_observed_ms{};
 std::string dispatch_last_gift_skip_id;
+// The Task StartExpeditionAsync() returns is otherwise discarded, so a
+// dispatch that the game silently drops looks identical in the log to one
+// still in flight.  Root it and poll IsCompleted/IsFaulted -- the same
+// read-only pattern already used for the nectar claim Task below -- so the
+// history TSV records whether the RPC itself ever completed and how.
+void *pending_expedition_task{};
+uint32_t pending_expedition_task_handle{};
+std::string pending_expedition_task_id;
+std::string pending_expedition_task_kind;
+long long pending_expedition_task_started_ms{};
 std::string observed_expedition_task_id;
 int64_t observed_expedition_duration_ms{};
 std::map<std::string, FlowerRecord> flowers;
@@ -859,6 +869,13 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                     start_requested = true;
                     dispatch_confirmation_pending_id = id_text;
                     dispatch_confirmation_started_observed_ms = observed_ms;
+                    if (start_result && gchandle_new) {
+                        pending_expedition_task = start_result;
+                        pending_expedition_task_handle = gchandle_new(start_result, false);
+                        pending_expedition_task_id = id_text;
+                        pending_expedition_task_kind = kind;
+                        pending_expedition_task_started_ms = now_ms();
+                    }
                     append_dispatch_history("start-requested", kind, id_text, game_duration, picked_count);
                     LOGI("[DISPATCH] start requested task=%s duration=%" PRId64 " picked=%d result=%p canStartAfter=%d finishAfter=%" PRId64,
                          id_text.c_str(), game_duration, picked_count, start_result,
@@ -1668,6 +1685,37 @@ void poll_pending_task() {
     clear_pending_task();
 }
 
+// StartExpeditionAsync() returns a plain Task with no response body, so the
+// only thing worth reading is IsCompleted/IsFaulted -- the same read-only
+// pattern poll_pending_task() already uses safely.  On 2026-08-29 a fruit
+// dispatched from 0.2 m produced a "start requested" log line and never
+// confirmed; a retry from the same spot minutes later confirmed in 15 s.
+// Nothing distinguished the two in the log.  This makes that distinction
+// visible: whether the RPC itself ever completed, and whether it faulted.
+void poll_pending_expedition_task() {
+    if (!pending_expedition_task) return;
+    if (!task_is_completed || !task_is_completed(pending_expedition_task, nullptr)) {
+        // A Task that never completes would otherwise watch forever.
+        if (now_ms() - pending_expedition_task_started_ms > 30000) {
+            LOGW("[DISPATCH-RPC] task=%s not completed after 30s; abandoning watch",
+                 pending_expedition_task_id.c_str());
+            pending_expedition_task = nullptr;
+        }
+        return;
+    }
+    const bool faulted = task_is_faulted && task_is_faulted(pending_expedition_task, nullptr);
+    const int64_t elapsed_ms = now_ms() - pending_expedition_task_started_ms;
+    LOGI("[DISPATCH-RPC] task=%s completed faulted=%d elapsedMs=%" PRId64,
+         pending_expedition_task_id.c_str(), faulted ? 1 : 0, elapsed_ms);
+    append_dispatch_history(faulted ? "start-rpc-faulted" : "start-rpc-completed",
+                            pending_expedition_task_kind.c_str(), pending_expedition_task_id, elapsed_ms, 0);
+    // Not releasing the GC handle mirrors clear_pending_task(): freeing a
+    // just-completed Task raced an IL2CPP continuation on v150 and crashed
+    // the main thread, and expeditions per session are few enough that
+    // retaining the handle is the cheaper trade-off.
+    pending_expedition_task = nullptr;
+}
+
 void write_status(const std::string &mode, bool online, bool planting) {
     double latitude{}, longitude{};
     const bool has_location = current_location(latitude, longitude);
@@ -1690,6 +1738,7 @@ void maybe_claim() {
     last_tick_ms = current;
     const std::string mode = read_mode();
     poll_pending_task();
+    poll_pending_expedition_task();
     const bool online = network_available();
     const bool planting = is_planting();
     write_status(mode, online, planting);
