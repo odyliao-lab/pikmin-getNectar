@@ -809,7 +809,11 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         // Only trustworthy since current_location() now fails closed on a
         // stale fallback file (see kSystemGpsMaxAgeSeconds); at the old 25 m
         // this same reading was once 111 m wrong for over an hour.
-        const double allowed_distance = batch ? 4.0 : 1000.0;
+        // Armed mode's own radius: previously a proxy via the game's derived
+        // travel duration (<=5 minutes); now a direct GPS check against the
+        // same distance reading, at the user's request for a literal radius
+        // instead of an indirect time estimate.
+        const double allowed_distance = batch ? 4.0 : 200.0;
         if (dispatch_confirmation_pending_id.empty() && requested && !selection_applied && data && picked &&
             picked_count > 0 && set_expedition_pikmins &&
             distance >= 0.0 && distance <= allowed_distance) {
@@ -827,9 +831,12 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 selection_applied = true;
                 LOGI("[DISPATCH-OBSERVE] armed selection task=%s duration=%" PRId64 " canStart=%d picked=%d",
                      id_text.c_str(), game_duration, can_start ? 1 : 0, picked_count);
-                gift_pikmin_unavailable = is_gift &&
-                        (game_duration <= 0 || game_duration > 5 * 60 * 1000 || !can_start);
-                if (game_duration > 0 && game_duration <= 5 * 60 * 1000 && can_start && start_expedition) {
+                // distance is already <= allowed_distance here (checked above),
+                // so the radius gate for this dispatch is the distance check,
+                // not the game's derived duration -- can_start is the only
+                // remaining game-side condition.
+                gift_pikmin_unavailable = is_gift && !can_start;
+                if (can_start && start_expedition) {
                     void *start_result = start_expedition(data, nullptr);
                     const bool can_start_after = get_expedition_can_try_start
                             ? get_expedition_can_try_start(data, nullptr) : false;
@@ -1690,6 +1697,20 @@ void poll_pending_expedition_task() {
          pending_expedition_task_id.c_str(), faulted ? 1 : 0, elapsed_ms);
     append_dispatch_history(faulted ? "start-rpc-faulted" : "start-rpc-completed",
                             pending_expedition_task_kind.c_str(), pending_expedition_task_id, elapsed_ms, 0);
+    // A faulted RPC never actually started the expedition, so the task
+    // stays in the unfinished list forever -- neither of the two normal
+    // release paths in write_dispatch_candidates (finish_ms becoming
+    // non-zero, or the task disappearing from the projection) can ever
+    // fire for it. Without this, armed mode (which has no equivalent of
+    // batch mode's Java-side releaseNativeConfirmationLock()) gets stuck
+    // reporting "no-dispatch" forever after a single faulted attempt,
+    // until dispatch mode is toggled off and back on by hand. Release the
+    // lock here instead, at the point the fault is actually detected, so
+    // the very next tick can retry.
+    if (faulted && dispatch_confirmation_pending_id == pending_expedition_task_id) {
+        dispatch_confirmation_pending_id.clear();
+        dispatch_confirmation_started_observed_ms = 0;
+    }
     // Not releasing the GC handle mirrors clear_pending_task(): freeing a
     // just-completed Task raced an IL2CPP continuation on v150 and crashed
     // the main thread, and expeditions per session are few enough that
