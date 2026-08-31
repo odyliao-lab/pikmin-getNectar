@@ -106,6 +106,9 @@ using EnumeratorCurrent = void *(*)(void *, void *);
 using PickFastestPikmins = void *(*)(void *, void *, void *, void *, void *);
 using SetExpeditionPikmins = void (*)(void *, void *, void *);
 using StartExpedition = void *(*)(void *, void *);
+// Shape shared by any zero-arg managed getter that returns an object
+// reference (System.Threading.Tasks.Task.Exception, Exception.Message, ...).
+using ObjectGetter = void *(*)(void *, void *);
 using PikminTaskPreparerConstructor = void (*)(void *, void *, void *, void *, void *);
 using PikminTaskActionManagerConstructor = void (*)(void *, void *);
 
@@ -254,6 +257,11 @@ char dispatch_target_path[512]{};
 char dispatch_ready_path[512]{};
 char dispatch_history_path[512]{};
 char dispatch_diagnostics_path[512]{};
+// Forensic log for start_expedition() RPC faults -- see
+// append_rpc_fault_diagnostics() and read_task_exception_message() below.
+// Kept separate from dispatch_history.tsv so it never touches that file's
+// existing column contract (the Java side parses it with a fixed split).
+char dispatch_rpc_fault_path[512]{};
 std::string dispatch_confirmation_pending_id;
 long long dispatch_confirmation_started_observed_ms{};
 std::string dispatch_last_gift_skip_id;
@@ -267,6 +275,13 @@ uint32_t pending_expedition_task_handle{};
 std::string pending_expedition_task_id;
 std::string pending_expedition_task_kind;
 long long pending_expedition_task_started_ms{};
+// When the previous start_expedition() attempt (of any outcome) began, and
+// how many faults have landed back-to-back -- both feed
+// append_rpc_fault_diagnostics() so a rate-limit or streak pattern in the
+// fault rate is visible without guessing at the game's internal reason.
+long long last_expedition_attempt_started_ms{};
+int consecutive_expedition_rpc_faults{};
+long long pending_expedition_ms_since_previous_attempt = -1;
 std::string observed_expedition_task_id;
 int64_t observed_expedition_duration_ms{};
 std::map<std::string, FlowerRecord> flowers;
@@ -837,6 +852,14 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 // remaining game-side condition.
                 gift_pikmin_unavailable = is_gift && !can_start;
                 if (can_start && start_expedition) {
+                    // Recorded before the call so a rate-limit hypothesis for
+                    // the fault rate (see append_rpc_fault_diagnostics) can be
+                    // checked against how soon this attempt followed the last
+                    // one, not just whether it faulted.
+                    const long long attempt_now = now_ms();
+                    pending_expedition_ms_since_previous_attempt = last_expedition_attempt_started_ms > 0
+                            ? attempt_now - last_expedition_attempt_started_ms : -1;
+                    last_expedition_attempt_started_ms = attempt_now;
                     void *start_result = start_expedition(data, nullptr);
                     const bool can_start_after = get_expedition_can_try_start
                             ? get_expedition_can_try_start(data, nullptr) : false;
@@ -1454,6 +1477,48 @@ std::string read_string(void *value) {
     return result;
 }
 
+// Best-effort, read-only lookup of a faulted Task's exception, entirely
+// through the same dynamic class/method resolution already used safely
+// elsewhere in this file (find_class + class_get_method_from_name +
+// object_get_virtual_method for polymorphic dispatch) -- never a hardcoded
+// RVA, so a method that does not resolve just yields an empty string
+// instead of guessing an offset into this exact game build. IsFaulted alone
+// only says a dispatch failed, not why; this is what would let a rate-limit
+// or validation message distinguish itself from a bare transient failure.
+std::string read_task_exception_message(void *task) {
+    if (!task || !object_get_class || !class_get_method_from_name) return {};
+    void *task_class = object_get_class(task);
+    void *get_exception_method = task_class ? class_get_method_from_name(task_class, "get_Exception", 0) : nullptr;
+    auto get_exception = get_exception_method
+            ? reinterpret_cast<ObjectGetter>(*reinterpret_cast<void **>(get_exception_method)) : nullptr;
+    void *exception = get_exception ? get_exception(task, nullptr) : nullptr;
+    if (!exception) return {};
+    void *exception_class = object_get_class(exception);
+    const char *exception_class_name = exception_class && class_get_name ? class_get_name(exception_class) : nullptr;
+    void *message_method = exception_class ? class_get_method_from_name(exception_class, "get_Message", 0) : nullptr;
+    void *message_impl = message_method && object_get_virtual_method
+            ? object_get_virtual_method(exception, message_method) : message_method;
+    auto get_message = message_impl
+            ? reinterpret_cast<ObjectGetter>(*reinterpret_cast<void **>(message_impl)) : nullptr;
+    void *message = get_message ? get_message(exception, nullptr) : nullptr;
+    std::string text = read_string(message);
+    if (exception_class_name && !text.empty()) return std::string(exception_class_name) + ": " + text;
+    if (exception_class_name) return exception_class_name;
+    return text;
+}
+
+void append_rpc_fault_diagnostics(const std::string &task_id, const char *kind, bool faulted,
+                                  int64_t elapsed_ms, int64_t ms_since_previous_attempt,
+                                  int consecutive_faults, const std::string &exception_text) {
+    FILE *file = std::fopen(dispatch_rpc_fault_path, "a");
+    if (!file) return;
+    std::fprintf(file, "%lld\t%s\t%s\t%d\t%" PRId64 "\t%" PRId64 "\t%d\t%s\n",
+                 now_ms(), task_id.c_str(), kind ? kind : "", faulted ? 1 : 0, elapsed_ms,
+                 ms_since_previous_attempt, consecutive_faults, exception_text.c_str());
+    std::fclose(file);
+    chmod(dispatch_rpc_fault_path, 0644);
+}
+
 std::string read_mode() {
     FILE *file = std::fopen(mode_path, "r");
     if (!file) return "diag";
@@ -1693,10 +1758,19 @@ void poll_pending_expedition_task() {
     }
     const bool faulted = task_is_faulted && task_is_faulted(pending_expedition_task, nullptr);
     const int64_t elapsed_ms = now_ms() - pending_expedition_task_started_ms;
-    LOGI("[DISPATCH-RPC] task=%s completed faulted=%d elapsedMs=%" PRId64,
-         pending_expedition_task_id.c_str(), faulted ? 1 : 0, elapsed_ms);
+    // Best-effort only: read_task_exception_message() resolves everything
+    // dynamically by name and returns empty on any unresolved step, so a
+    // build where this does not work costs nothing beyond an empty column.
+    const std::string exception_text = faulted ? read_task_exception_message(pending_expedition_task) : std::string();
+    consecutive_expedition_rpc_faults = faulted ? consecutive_expedition_rpc_faults + 1 : 0;
+    LOGI("[DISPATCH-RPC] task=%s completed faulted=%d elapsedMs=%" PRId64 " streak=%d exception=%s",
+         pending_expedition_task_id.c_str(), faulted ? 1 : 0, elapsed_ms, consecutive_expedition_rpc_faults,
+         exception_text.empty() ? "-" : exception_text.c_str());
     append_dispatch_history(faulted ? "start-rpc-faulted" : "start-rpc-completed",
                             pending_expedition_task_kind.c_str(), pending_expedition_task_id, elapsed_ms, 0);
+    append_rpc_fault_diagnostics(pending_expedition_task_id, pending_expedition_task_kind.c_str(), faulted,
+                                 elapsed_ms, pending_expedition_ms_since_previous_attempt,
+                                 consecutive_expedition_rpc_faults, exception_text);
     // A faulted RPC never actually started the expedition, so the task
     // stays in the unfinished list forever -- neither of the two normal
     // release paths in write_dispatch_candidates (finish_ms becoming
@@ -2211,6 +2285,7 @@ void start(const char *game_data_dir) {
     std::snprintf(dispatch_ready_path, sizeof(dispatch_ready_path), "/data/local/tmp/pikmin-dispatch-ready.tsv");
     std::snprintf(dispatch_history_path, sizeof(dispatch_history_path), "%s/files/dispatch_history.tsv", game_data_dir);
     std::snprintf(dispatch_diagnostics_path, sizeof(dispatch_diagnostics_path), "%s/files/dispatch_diagnostics.tsv", game_data_dir);
+    std::snprintf(dispatch_rpc_fault_path, sizeof(dispatch_rpc_fault_path), "%s/files/dispatch_rpc_faults.tsv", game_data_dir);
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);
