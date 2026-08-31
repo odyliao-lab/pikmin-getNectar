@@ -270,6 +270,15 @@ char dispatch_diagnostics_path[512]{};
 // Kept separate from dispatch_history.tsv so it never touches that file's
 // existing column contract (the Java side parses it with a fixed split).
 char dispatch_rpc_fault_path[512]{};
+// Forensic log for a batch target that fails the dispatch gate without ever
+// reaching start_expedition() -- see the "batch target blocked" LOGI site.
+// Persisted (not just logged) because a full batch run can take many
+// minutes and this needs to be readable after the fact, not only via a
+// live logcat capture.
+char dispatch_gate_block_path[512]{};
+// Per-tick heartbeat while a batch target is set -- see the call site in
+// write_dispatch_candidates() and append_dispatch_tick_trace() below.
+char dispatch_tick_trace_path[512]{};
 std::string dispatch_confirmation_pending_id;
 long long dispatch_confirmation_started_observed_ms{};
 std::string dispatch_last_gift_skip_id;
@@ -350,6 +359,11 @@ bool dispatch_target_is_ready(const std::string &target_id, long long observed_m
 void append_dispatch_history(const char *event, const char *kind, const std::string &task_id,
                              int64_t duration_ms, int picked_count);
 void log_class_methods(const char *label, void *proto_class);
+void append_dispatch_gate_block(const std::string &task_id, const char *kind, bool lock_held,
+                                bool requested, bool has_data, bool has_picked, int picked_count,
+                                double distance, double allowed_distance);
+void append_dispatch_tick_trace(const std::string &batch_target, bool target_seen_raw,
+                                int raw_count, int filtered_count);
 
 std::string utf8_string(void *value) {
     if (!value) return {};
@@ -746,6 +760,14 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     bool selection_applied{};
     bool start_requested{};
     bool pending_confirmation_seen{};
+    // Whether this tick's raw list (before any of the continue-filters
+    // below) contained the batch's named target at all -- see the tick
+    // heartbeat appended after the loop. Distinguishes "the native tick
+    // loop stopped running" from "it ran, but this candidate was
+    // temporarily missing from what the game handed back", which look
+    // identical from the Java side (both show as a silent stretch ending
+    // in game-refresh-timeout).
+    bool batch_target_seen_raw{};
     for (int index = 0; index < count; ++index) {
         void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
         void *proto = task ? get_pikmin_task_proto(task, nullptr) : nullptr;
@@ -773,6 +795,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         if (!task || !expedition || !kind) continue;
         void *id = get_inventory_item_id ? get_inventory_item_id(task, nullptr) : nullptr;
         const std::string id_text = utf8_string(id);
+        if (batch && !batch_target.empty() && id_text == batch_target) batch_target_seen_raw = true;
         if (confirmation_due && id_text == dispatch_confirmation_pending_id)
             pending_confirmation_seen = true;
         if (finish_ms != 0) {
@@ -922,16 +945,45 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                     dispatch_last_gift_skip_id = id_text;
                 }
             }
-        } else if (batch_ready && id_text == batch_target && gift_pikmin_unavailable &&
-                   dispatch_last_gift_skip_id != id_text) {
-            append_dispatch_history("gift-pikmin-unavailable", kind, id_text,
-                                    game_duration, picked_count);
-            dispatch_last_gift_skip_id = id_text;
+        } else if (batch_ready && id_text == batch_target) {
+            // The batch's own named target failed the dispatch gate this
+            // tick without ever reaching start_expedition() -- Java-side
+            // this is invisible and eventually times out as
+            // game-refresh-timeout, indistinguishable from an RPC fault
+            // without this. Breaks down every sub-condition of the big `if`
+            // above so a game_refresh_timeout can be told apart from an
+            // actual INVALID_ARGUMENT fault: is it the confirmation lock
+            // still held, the team picker returning nothing/zero, or the
+            // native distance reading disagreeing with the 4 m batch gate
+            // Control Center already thought it satisfied?
+            const bool lock_held = !dispatch_confirmation_pending_id.empty();
+            LOGI("[DISPATCH-GATE] batch target blocked task=%s lockHeld=%d requested=%d data=%p picked=%p pickedCount=%d distance=%.2fm allowed=%.1fm",
+                 id_text.c_str(), lock_held ? 1 : 0, requested ? 1 : 0,
+                 data, picked, picked_count, distance, allowed_distance);
+            append_dispatch_gate_block(id_text, kind, lock_held, requested, data != nullptr,
+                                       picked != nullptr, picked_count, distance, allowed_distance);
+            if (gift_pikmin_unavailable && dispatch_last_gift_skip_id != id_text) {
+                append_dispatch_history("gift-pikmin-unavailable", kind, id_text,
+                                        game_duration, picked_count);
+                dispatch_last_gift_skip_id = id_text;
+            }
         }
         std::fprintf(file, "%lld\t%s\t%s\t0\t%" PRId64 "\t%.7f\t%.7f\tpending-travel-estimate\t%.1f\t%" PRId64 "\t%d\t%d\n", observed_ms,
                      kind, id_text.c_str(),
                      expiration_ms, latitude, longitude, distance, game_duration, can_start ? 1 : 0, picked_count);
         ++candidates;
+    }
+    // Tick heartbeat, batch mode only: proves this observation tick actually
+    // ran (vs. the whole native tick loop having silently stopped, e.g. the
+    // same underlying cause already found for "掃描" returning 0
+    // candidates) and separately whether the batch's named target was even
+    // present in the raw list this tick (vs. present but blocked -- see the
+    // "batch target blocked" log above). A long stretch of no new lines
+    // here during a game-refresh-timeout means the tick loop itself
+    // stalled; lines present but batchTargetSeen=0 means the target
+    // transiently vanished from what the game handed back.
+    if (batch && !batch_target.empty()) {
+        append_dispatch_tick_trace(batch_target, batch_target_seen_raw, count, candidates);
     }
     // GetPikminTaskList is the live inventory projection. Once a task that was
     // just submitted is absent from a later complete projection, record that
@@ -1561,6 +1613,28 @@ void append_rpc_fault_diagnostics(const std::string &task_id, const char *kind, 
                  ms_since_previous_attempt, consecutive_faults, exception_text.c_str());
     std::fclose(file);
     chmod(dispatch_rpc_fault_path, 0644);
+}
+
+void append_dispatch_gate_block(const std::string &task_id, const char *kind, bool lock_held,
+                                bool requested, bool has_data, bool has_picked, int picked_count,
+                                double distance, double allowed_distance) {
+    FILE *file = std::fopen(dispatch_gate_block_path, "a");
+    if (!file) return;
+    std::fprintf(file, "%lld\t%s\t%s\t%d\t%d\t%d\t%d\t%d\t%.2f\t%.1f\n",
+                 now_ms(), task_id.c_str(), kind ? kind : "", lock_held ? 1 : 0, requested ? 1 : 0,
+                 has_data ? 1 : 0, has_picked ? 1 : 0, picked_count, distance, allowed_distance);
+    std::fclose(file);
+    chmod(dispatch_gate_block_path, 0644);
+}
+
+void append_dispatch_tick_trace(const std::string &batch_target, bool target_seen_raw,
+                                int raw_count, int filtered_count) {
+    FILE *file = std::fopen(dispatch_tick_trace_path, "a");
+    if (!file) return;
+    std::fprintf(file, "%lld\t%s\t%d\t%d\t%d\n",
+                 now_ms(), batch_target.c_str(), target_seen_raw ? 1 : 0, raw_count, filtered_count);
+    std::fclose(file);
+    chmod(dispatch_tick_trace_path, 0644);
 }
 
 std::string read_mode() {
@@ -2330,6 +2404,8 @@ void start(const char *game_data_dir) {
     std::snprintf(dispatch_history_path, sizeof(dispatch_history_path), "%s/files/dispatch_history.tsv", game_data_dir);
     std::snprintf(dispatch_diagnostics_path, sizeof(dispatch_diagnostics_path), "%s/files/dispatch_diagnostics.tsv", game_data_dir);
     std::snprintf(dispatch_rpc_fault_path, sizeof(dispatch_rpc_fault_path), "%s/files/dispatch_rpc_faults.tsv", game_data_dir);
+    std::snprintf(dispatch_gate_block_path, sizeof(dispatch_gate_block_path), "%s/files/dispatch_gate_blocks.tsv", game_data_dir);
+    std::snprintf(dispatch_tick_trace_path, sizeof(dispatch_tick_trace_path), "%s/files/dispatch_tick_trace.tsv", game_data_dir);
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);
