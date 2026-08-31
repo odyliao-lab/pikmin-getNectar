@@ -213,6 +213,14 @@ GetTaskVariant get_expedition_item_key{};
 GetExpeditionDurationMs original_get_expedition_total_duration_ms{};
 GetExpeditionDataByIndex get_expedition_data_by_index{};
 GetExpeditionBool get_expedition_can_try_start{};
+// Two more candidates from the INVALID_ARGUMENT investigation
+// (HANDOFF_2026-08-31_RPC_DIAGNOSTICS.md): CanTryStart alone may not be the
+// full precondition set the server checks, and the picked team's cached
+// carrying-power/duration fields may be stale immediately after a GPS
+// teleport if the game's own UI flow normally forces a recompute that this
+// module's tighter selection-to-start window skips.
+GetExpeditionBool get_expedition_has_enough_carrying_power{};
+SimpleMethod invalidate_expedition_cached_values{};
 ExpeditionDataStoreConstructor original_expedition_data_store_constructor{};
 GetEnumerable get_pikmin_item_collection{};
 PickFastestPikmins pick_fastest_pikmins{};
@@ -314,6 +322,15 @@ bool return_bloomed_poi_fruit_entry_metadata_logged{};
 bool dispatch_enumerable_metadata_logged{};
 bool gift_pikmin_metadata_logged{};
 bool gift_target_metadata_logged{};
+// Metadata-only, zero-invocation-risk probe for whether ExpeditionItemData
+// exposes a preparation/validation method (Lock*, Prepare*, Validate*, ...)
+// that the game's own UI might call before StartExpeditionAsync and that
+// this module currently skips -- see the INVALID_ARGUMENT investigation in
+// HANDOFF_2026-08-31_RPC_DIAGNOSTICS.md. Logged once per process, from the
+// real runtime class via object_get_class() rather than the static
+// find_class() lookup, so it reflects the exact instance in play.
+bool expedition_item_metadata_logged{};
+bool expedition_utils_metadata_logged{};
 void *pending_task{};
 uint32_t pending_task_handle{};
 std::string pending_id;
@@ -780,6 +797,17 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 ? distance_metres(current_latitude, current_longitude, latitude, longitude) : -1.0;
         void *data = expedition_data_store && get_expedition_data_by_index
                 ? get_expedition_data_by_index(expedition_data_store, 0, id, nullptr) : nullptr;
+        if (data && !expedition_item_metadata_logged && object_get_class) {
+            expedition_item_metadata_logged = true;
+            log_class_methods("ExpeditionItemData", object_get_class(data));
+        }
+        // Force a recompute of this item's cached fields (duration,
+        // CanTryStart, carrying power, ...) before reading any of them.
+        // Candidate fix for the INVALID_ARGUMENT investigation: after a GPS
+        // teleport, these caches may only refresh when the game's own UI
+        // flow touches them, which this module's tighter
+        // selection-to-start window otherwise skips.
+        if (data && invalidate_expedition_cached_values) invalidate_expedition_cached_values(data, nullptr);
         int64_t game_duration = data && original_get_expedition_total_duration_ms
                 ? original_get_expedition_total_duration_ms(data, nullptr) : 0;
         bool can_start = data && get_expedition_can_try_start
@@ -788,6 +816,10 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         const bool is_gift = std::strcmp(kind, "gift") == 0;
         void *utils = data ? *reinterpret_cast<void **>(static_cast<uint8_t *>(data) + 0x48) : nullptr;
         void *scope = data ? *reinterpret_cast<void **>(static_cast<uint8_t *>(data) + 0x98) : nullptr;
+        if (utils && !expedition_utils_metadata_logged && object_get_class) {
+            expedition_utils_metadata_logged = true;
+            log_class_methods("ExpeditionUtilsInstance", object_get_class(utils));
+        }
         void *pikmins = return_inventory_manager && get_pikmin_item_collection
                 ? get_pikmin_item_collection(return_inventory_manager, nullptr) : nullptr;
         void *picked = utils && pick_fastest_pikmins && pikmins && scope
@@ -843,9 +875,11 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                         ? original_get_expedition_total_duration_ms(data, nullptr) : game_duration;
                 can_start = get_expedition_can_try_start
                         ? get_expedition_can_try_start(data, nullptr) : can_start;
+                const bool carrying_power_after = get_expedition_has_enough_carrying_power
+                        ? get_expedition_has_enough_carrying_power(data, nullptr) : true;
                 selection_applied = true;
-                LOGI("[DISPATCH-OBSERVE] armed selection task=%s duration=%" PRId64 " canStart=%d picked=%d",
-                     id_text.c_str(), game_duration, can_start ? 1 : 0, picked_count);
+                LOGI("[DISPATCH-OBSERVE] armed selection task=%s duration=%" PRId64 " canStart=%d picked=%d carryingPower=%d",
+                     id_text.c_str(), game_duration, can_start ? 1 : 0, picked_count, carrying_power_after ? 1 : 0);
                 // distance is already <= allowed_distance here (checked above),
                 // so the radius gate for this dispatch is the distance check,
                 // not the game's derived duration -- can_start is the only
@@ -1310,6 +1344,16 @@ void install_return_diagnostic_hook() {
             ? class_get_method_from_name(expedition_item_class, "get_CanTryStart", 0) : nullptr;
     get_expedition_can_try_start = can_start_method
             ? reinterpret_cast<GetExpeditionBool>(*reinterpret_cast<void **>(can_start_method)) : nullptr;
+    void *carrying_power_method = expedition_item_class
+            ? class_get_method_from_name(expedition_item_class, "get_HasEnoughCarryingPower", 0) : nullptr;
+    get_expedition_has_enough_carrying_power = carrying_power_method
+            ? reinterpret_cast<GetExpeditionBool>(*reinterpret_cast<void **>(carrying_power_method)) : nullptr;
+    void *invalidate_cached_method = expedition_item_class
+            ? class_get_method_from_name(expedition_item_class, "InvalidateAllCachedValues", 0) : nullptr;
+    invalidate_expedition_cached_values = invalidate_cached_method
+            ? reinterpret_cast<SimpleMethod>(*reinterpret_cast<void **>(invalidate_cached_method)) : nullptr;
+    LOGI("[DISPATCH-OBSERVE] carrying power method=%p invalidateCached method=%p",
+         carrying_power_method, invalidate_cached_method);
     void *set_pikmins_method = expedition_item_class
             ? class_get_method_from_name(expedition_item_class, "SetPikmins", 1) : nullptr;
     set_expedition_pikmins = set_pikmins_method
