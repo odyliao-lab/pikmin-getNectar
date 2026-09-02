@@ -109,6 +109,7 @@ using StartExpedition = void *(*)(void *, void *);
 using GetManagedString = void *(*)(void *, void *);
 using StartPlantingWithConfirmation = void *(*)(void *, void *, bool, void *);
 using StopPlantingWithConfirmation = void *(*)(void *, bool, void *);
+using NoArgTask = void *(*)(void *, void *);
 // Shape shared by any zero-arg managed getter that returns an object
 // reference (System.Threading.Tasks.Task.Exception, Exception.Message, ...).
 using ObjectGetter = void *(*)(void *, void *);
@@ -232,6 +233,8 @@ StartExpedition start_expedition{};
 GetManagedString get_planting_flower_petal_id{};
 StartPlantingWithConfirmation start_planting_with_confirmation{};
 StopPlantingWithConfirmation stop_planting_with_confirmation{};
+NoArgTask close_planting_result_dialog{};
+SimpleMethod original_planting_result_dialog_start{};
 PikminTaskPreparerConstructor original_pikmin_task_preparer_constructor{};
 PikminTaskActionManagerConstructor original_pikmin_task_action_manager_constructor{};
 TaskBool task_is_completed{};
@@ -374,6 +377,12 @@ std::string planting_control_last_mode = "observe";
 std::string planting_control_last_action = "observe";
 void *planting_control_pending_task{};
 uint32_t planting_control_pending_task_handle{};
+void *planting_result_dialog{};
+long long planting_result_dialog_seen_ms{};
+long long planting_result_stop_requested_ms{};
+long long planting_result_close_after_ms{};
+bool planting_result_auto_close_pending{};
+bool planting_result_hook_installed{};
 // Metadata-only, zero-invocation-risk probe for whether ExpeditionItemData
 // exposes a preparation/validation method (Lock*, Prepare*, Validate*, ...)
 // that the game's own UI might call before StartExpeditionAsync and that
@@ -1795,6 +1804,19 @@ void write_planting_control_status(const std::string &mode, bool planting,
     chmod(planting_control_status_path, 0644);
 }
 
+void maybe_dismiss_planting_result_dialog() {
+    if (!planting_result_auto_close_pending || !planting_result_dialog || !close_planting_result_dialog) return;
+    const long long now = now_ms();
+    // Only a dialog created after this module-owned stop request is eligible.
+    // This prevents a later controller action from closing a player's older,
+    // manually-created result dialog.
+    if (planting_result_dialog_seen_ms < planting_result_stop_requested_ms || now < planting_result_close_after_ms) return;
+    void *task = close_planting_result_dialog(planting_result_dialog, nullptr);
+    if (task && gchandle_new) gchandle_new(task, false);
+    LOGI("[PLANTING-CONTROL] auto-dismissed owned result dialog task=%p", task);
+    planting_result_auto_close_pending = false;
+}
+
 // "on" and "off" are explicit commands from Control Center.  Anything
 // else, including a missing file, is passive observation. This protects a
 // manual planting session from being stopped merely because the controller
@@ -1812,6 +1834,7 @@ std::string read_planting_control_mode() {
 }
 
 void maybe_manage_planting() {
+    maybe_dismiss_planting_result_dialog();
     const std::string mode = read_planting_control_mode();
     const bool planting = is_planting();
     if (mode != planting_control_last_mode) {
@@ -1868,6 +1891,13 @@ void maybe_manage_planting() {
             planting_control_pending_task_handle = gchandle_new(task, false);
         }
         planting_control_stop_attempted = true;
+        // StopPlantingWithConfirmationAsync ends with the game's own result
+        // dialog. Defer closing until its real Start() hook captures the new
+        // instance, then call that dialog's own close handler rather than a
+        // screen coordinate or Accessibility gesture.
+        planting_result_stop_requested_ms = now_ms();
+        planting_result_close_after_ms = planting_result_stop_requested_ms + 1000;
+        planting_result_auto_close_pending = true;
         planting_control_last_action = task ? "stop-requested" : "stop-no-task";
         LOGI("[PLANTING-CONTROL] stop requested task=%p", task);
         write_planting_control_status(mode, true, planting_control_last_action.c_str());
@@ -2612,6 +2642,12 @@ void hooked_map_update(void *self, void *method_info) {
     maybe_claim();
     maybe_return_tasks();
 }
+void hooked_planting_result_dialog_start(void *self, void *method_info) {
+    if (original_planting_result_dialog_start) original_planting_result_dialog_start(self, method_info);
+    planting_result_dialog = self;
+    planting_result_dialog_seen_ms = now_ms();
+    LOGI("[PLANTING-CONTROL] result dialog observed self=%p", self);
+}
 void hooked_planting_init(void *self, void *method_info) {
     if (original_planting_init) original_planting_init(self, method_info);
     planting_controller = self;
@@ -2628,6 +2664,17 @@ void hooked_planting_init(void *self, void *method_info) {
                 ? reinterpret_cast<StartPlantingWithConfirmation>(*reinterpret_cast<void **>(start_method)) : nullptr;
         stop_planting_with_confirmation = stop_method
                 ? reinterpret_cast<StopPlantingWithConfirmation>(*reinterpret_cast<void **>(stop_method)) : nullptr;
+        void *dialog_class = find_class("Niantic.Ichigo.Game.Flowers.PlantingResultDialog", "FlowerPlantingResultDialog");
+        void *dialog_start_method = dialog_class ? class_get_method_from_name(dialog_class, "Start", 0) : nullptr;
+        void *dialog_close_method = dialog_class ? class_get_method_from_name(dialog_class, "OnCloseButtonClicked", 0) : nullptr;
+        close_planting_result_dialog = dialog_close_method
+                ? reinterpret_cast<NoArgTask>(*reinterpret_cast<void **>(dialog_close_method)) : nullptr;
+        if (dialog_start_method && !planting_result_hook_installed) {
+            A64HookFunction(*reinterpret_cast<void **>(dialog_start_method),
+                            reinterpret_cast<void *>(hooked_planting_result_dialog_start),
+                            reinterpret_cast<void **>(&original_planting_result_dialog_start));
+            planting_result_hook_installed = original_planting_result_dialog_start != nullptr;
+        }
         LOGI("[PLANTING-CONTROL] methods petal=%p start=%p stop=%p",
              get_planting_flower_petal_id, start_planting_with_confirmation,
              stop_planting_with_confirmation);
