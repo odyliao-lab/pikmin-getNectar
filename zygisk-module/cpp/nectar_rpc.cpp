@@ -110,6 +110,7 @@ using GetManagedString = void *(*)(void *, void *);
 using StartPlantingWithConfirmation = void *(*)(void *, void *, bool, void *);
 using StopPlantingWithConfirmation = void *(*)(void *, bool, void *);
 using NoArgTask = void *(*)(void *, void *);
+using StaticNoArgTask = void *(*)(void *);
 // Shape shared by any zero-arg managed getter that returns an object
 // reference (System.Threading.Tasks.Task.Exception, Exception.Message, ...).
 using ObjectGetter = void *(*)(void *, void *);
@@ -158,6 +159,7 @@ RpcManagerLoggedIn original_rpc_manager_logged_in{};
 SimpleMethod original_planting_init{};
 SimpleMethod original_planting_start{};
 SimpleMethod original_planting_state_updated{};
+ObjectGetter original_maybe_show_speed_warning{};
 SimpleMethod original_location_controller_awake{};
 RequestConstructor request_constructor{};
 RequestSetString request_set_map_object_id{};
@@ -234,6 +236,7 @@ GetManagedString get_planting_flower_petal_id{};
 StartPlantingWithConfirmation start_planting_with_confirmation{};
 StopPlantingWithConfirmation stop_planting_with_confirmation{};
 NoArgTask close_planting_result_dialog{};
+StaticNoArgTask get_completed_task{};
 SimpleMethod original_planting_result_dialog_start{};
 PikminTaskPreparerConstructor original_pikmin_task_preparer_constructor{};
 PikminTaskActionManagerConstructor original_pikmin_task_action_manager_constructor{};
@@ -297,6 +300,10 @@ char dispatch_tick_trace_path[512]{};
 // must never stop a planting session that the player started manually.
 char planting_control_mode_path[512]{};
 char planting_control_status_path[512]{};
+// A separate, explicit flower-farm session flag.  It never changes the
+// game's speed calculation; it merely allows the native UI-warning hook
+// below to suppress its own modal while Control Center is moving a route.
+char flower_farm_mode_path[512]{};
 std::string dispatch_confirmation_pending_id;
 long long dispatch_confirmation_started_observed_ms{};
 std::string dispatch_last_gift_skip_id;
@@ -383,6 +390,7 @@ long long planting_result_stop_requested_ms{};
 long long planting_result_close_after_ms{};
 bool planting_result_auto_close_pending{};
 bool planting_result_hook_installed{};
+bool speed_warning_hook_installed{};
 // Metadata-only, zero-invocation-risk probe for whether ExpeditionItemData
 // exposes a preparation/validation method (Lock*, Prepare*, Validate*, ...)
 // that the game's own UI might call before StartExpeditionAsync and that
@@ -408,6 +416,7 @@ double distance_metres(double lat1, double lng1, double lat2, double lng2);
 std::string read_dispatch_mode();
 std::string read_dispatch_kind_filter();
 std::string read_planting_control_mode();
+bool flower_farm_session_active();
 std::string read_dispatch_target();
 bool dispatch_target_is_ready(const std::string &target_id, long long observed_ms);
 void append_dispatch_history(const char *event, const char *kind, const std::string &task_id,
@@ -1833,6 +1842,15 @@ std::string read_planting_control_mode() {
     return result == "off" ? "off" : "observe";
 }
 
+bool flower_farm_session_active() {
+    FILE *file = std::fopen(flower_farm_mode_path, "r");
+    if (!file) return false;
+    char value[16]{};
+    std::fgets(value, sizeof(value), file);
+    std::fclose(file);
+    return std::strncmp(value, "on", 2) == 0 && (value[2] == '\0' || value[2] == '\n' || value[2] == '\r');
+}
+
 void maybe_manage_planting() {
     maybe_dismiss_planting_result_dialog();
     const std::string mode = read_planting_control_mode();
@@ -2648,6 +2666,16 @@ void hooked_planting_result_dialog_start(void *self, void *method_info) {
     planting_result_dialog_seen_ms = now_ms();
     LOGI("[PLANTING-CONTROL] result dialog observed self=%p", self);
 }
+void *hooked_maybe_show_speed_warning(void *self, void *method_info) {
+    // Suppress only the modal presentation during a Control Center flower
+    // farm.  SpeedMonitor still samples and exposes IsPlayerSpeeding, so this
+    // cannot remove or bypass the game's actual speed restriction.
+    if (flower_farm_session_active() && get_completed_task) {
+        LOGI("[FLOWER-FARM] suppressed speed warning modal; restriction remains game-controlled");
+        return get_completed_task(nullptr);
+    }
+    return original_maybe_show_speed_warning ? original_maybe_show_speed_warning(self, method_info) : nullptr;
+}
 void hooked_planting_init(void *self, void *method_info) {
     if (original_planting_init) original_planting_init(self, method_info);
     planting_controller = self;
@@ -2674,6 +2702,20 @@ void hooked_planting_init(void *self, void *method_info) {
                             reinterpret_cast<void *>(hooked_planting_result_dialog_start),
                             reinterpret_cast<void **>(&original_planting_result_dialog_start));
             planting_result_hook_installed = original_planting_result_dialog_start != nullptr;
+        }
+        void *speed_monitor_class = find_class("Niantic.Ichigo.Location", "SpeedMonitor");
+        void *speed_warning_method = speed_monitor_class
+                ? class_get_method_from_name(speed_monitor_class, "MaybeShowSpeedWarningAsync", 0) : nullptr;
+        void *task_class = find_class("System.Threading.Tasks", "Task");
+        void *completed_task_method = task_class
+                ? class_get_method_from_name(task_class, "get_CompletedTask", 0) : nullptr;
+        get_completed_task = completed_task_method
+                ? reinterpret_cast<StaticNoArgTask>(*reinterpret_cast<void **>(completed_task_method)) : nullptr;
+        if (speed_warning_method && get_completed_task && !speed_warning_hook_installed) {
+            A64HookFunction(*reinterpret_cast<void **>(speed_warning_method),
+                            reinterpret_cast<void *>(hooked_maybe_show_speed_warning),
+                            reinterpret_cast<void **>(&original_maybe_show_speed_warning));
+            speed_warning_hook_installed = original_maybe_show_speed_warning != nullptr;
         }
         LOGI("[PLANTING-CONTROL] methods petal=%p start=%p stop=%p",
              get_planting_flower_petal_id, start_planting_with_confirmation,
@@ -2759,6 +2801,7 @@ void start(const char *game_data_dir) {
     std::snprintf(dispatch_tick_trace_path, sizeof(dispatch_tick_trace_path), "%s/files/dispatch_tick_trace.tsv", game_data_dir);
     std::snprintf(planting_control_mode_path, sizeof(planting_control_mode_path), "/data/local/tmp/pikmin-planting-mode.txt");
     std::snprintf(planting_control_status_path, sizeof(planting_control_status_path), "%s/files/planting_control_status.tsv", game_data_dir);
+    std::snprintf(flower_farm_mode_path, sizeof(flower_farm_mode_path), "/data/local/tmp/pikmin-flower-farm-mode.txt");
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);
