@@ -106,6 +106,9 @@ using EnumeratorCurrent = void *(*)(void *, void *);
 using PickFastestPikmins = void *(*)(void *, void *, void *, void *, void *);
 using SetExpeditionPikmins = void (*)(void *, void *, void *);
 using StartExpedition = void *(*)(void *, void *);
+using GetManagedString = void *(*)(void *, void *);
+using StartPlantingWithConfirmation = void *(*)(void *, void *, bool, void *);
+using StopPlantingWithConfirmation = void *(*)(void *, bool, void *);
 // Shape shared by any zero-arg managed getter that returns an object
 // reference (System.Threading.Tasks.Task.Exception, Exception.Message, ...).
 using ObjectGetter = void *(*)(void *, void *);
@@ -226,6 +229,9 @@ GetEnumerable get_pikmin_item_collection{};
 PickFastestPikmins pick_fastest_pikmins{};
 SetExpeditionPikmins set_expedition_pikmins{};
 StartExpedition start_expedition{};
+GetManagedString get_planting_flower_petal_id{};
+StartPlantingWithConfirmation start_planting_with_confirmation{};
+StopPlantingWithConfirmation stop_planting_with_confirmation{};
 PikminTaskPreparerConstructor original_pikmin_task_preparer_constructor{};
 PikminTaskActionManagerConstructor original_pikmin_task_action_manager_constructor{};
 TaskBool task_is_completed{};
@@ -280,6 +286,11 @@ char dispatch_gate_block_path[512]{};
 // Per-tick heartbeat while a batch target is set -- see the call site in
 // write_dispatch_candidates() and append_dispatch_tick_trace() below.
 char dispatch_tick_trace_path[512]{};
+// This is deliberately a separate control plane from nectar collection and
+// expedition dispatch. Missing/unknown values mean observe only: the module
+// must never stop a planting session that the player started manually.
+char planting_control_mode_path[512]{};
+char planting_control_status_path[512]{};
 std::string dispatch_confirmation_pending_id;
 long long dispatch_confirmation_started_observed_ms{};
 std::string dispatch_last_gift_skip_id;
@@ -353,6 +364,13 @@ bool gift_target_metadata_logged{};
 // stopping planting will not be attempted until this passive probe identifies
 // the game's real method contract.
 bool planting_controller_metadata_logged{};
+bool planting_control_owned{};
+bool planting_control_start_attempted{};
+bool planting_control_stop_attempted{};
+std::string planting_control_last_mode = "observe";
+std::string planting_control_last_action = "observe";
+void *planting_control_pending_task{};
+uint32_t planting_control_pending_task_handle{};
 // Metadata-only, zero-invocation-risk probe for whether ExpeditionItemData
 // exposes a preparation/validation method (Lock*, Prepare*, Validate*, ...)
 // that the game's own UI might call before StartExpeditionAsync and that
@@ -376,6 +394,7 @@ void log_task_variant_metadata(void *proto);
 bool current_location(double &latitude, double &longitude);
 double distance_metres(double lat1, double lng1, double lat2, double lng2);
 std::string read_dispatch_mode();
+std::string read_planting_control_mode();
 std::string read_dispatch_target();
 bool dispatch_target_is_ready(const std::string &target_id, long long observed_ms);
 void append_dispatch_history(const char *event, const char *kind, const std::string &task_id,
@@ -1758,6 +1777,106 @@ bool is_planting() {
     return sender && *reinterpret_cast<bool *>(static_cast<uint8_t *>(sender) + kChangeSenderItemOffset);
 }
 
+void write_planting_control_status(const std::string &mode, bool planting,
+                                   const char *action, const std::string &petal_id = {}) {
+    FILE *file = std::fopen(planting_control_status_path, "w");
+    if (!file) return;
+    std::fprintf(file, "%lld\t%s\t%d\t%d\t%s\t%s\n", now_ms(), mode.c_str(),
+                 planting ? 1 : 0, planting_control_owned ? 1 : 0,
+                 action, petal_id.empty() ? "-" : petal_id.c_str());
+    std::fclose(file);
+    chmod(planting_control_status_path, 0644);
+}
+
+// "on" and "off" are explicit commands from Control Center.  Anything
+// else, including a missing file, is passive observation. This protects a
+// manual planting session from being stopped merely because the controller
+// has not been installed/configured yet.
+std::string read_planting_control_mode() {
+    FILE *file = std::fopen(planting_control_mode_path, "r");
+    if (!file) return "observe";
+    char value[16]{};
+    std::fgets(value, sizeof(value), file);
+    std::fclose(file);
+    std::string result(value);
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r' || result.back() == ' ')) result.pop_back();
+    if (result == "on") return "on";
+    return result == "off" ? "off" : "observe";
+}
+
+void maybe_manage_planting() {
+    const std::string mode = read_planting_control_mode();
+    const bool planting = is_planting();
+    if (mode != planting_control_last_mode) {
+        planting_control_last_mode = mode;
+        planting_control_start_attempted = false;
+        planting_control_stop_attempted = false;
+    }
+    if (!planting_controller || !get_planting_flower_petal_id ||
+        !start_planting_with_confirmation || !stop_planting_with_confirmation) {
+        planting_control_last_action = "controller-unavailable";
+        write_planting_control_status(mode, planting, planting_control_last_action.c_str());
+        return;
+    }
+    if (mode == "on") {
+        if (planting) {
+            // Already active can be either our own session or a player-owned
+            // one. In the latter case leave ownership false so a later off
+            // never shuts down the player's session.
+            planting_control_last_action = planting_control_owned ? "active-owned" : "active-external";
+            write_planting_control_status(mode, true, planting_control_last_action.c_str());
+            return;
+        }
+        if (!planting_control_start_attempted) {
+            void *petal = get_planting_flower_petal_id(planting_controller, nullptr);
+            const std::string petal_id = utf8_string(petal);
+            if (!petal || petal_id.empty()) {
+                planting_control_start_attempted = true;
+                planting_control_last_action = "no-selected-petal";
+                write_planting_control_status(mode, false, planting_control_last_action.c_str());
+                return;
+            }
+            // false deliberately suppresses the UI confirmation dialog; the
+            // caller already made the explicit control-file decision. The
+            // game controller still validates petals, inventory and location.
+            void *task = start_planting_with_confirmation(planting_controller, petal, false, nullptr);
+            if (task && gchandle_new) {
+                planting_control_pending_task = task;
+                planting_control_pending_task_handle = gchandle_new(task, false);
+            }
+            planting_control_start_attempted = true;
+            planting_control_owned = true;
+            planting_control_last_action = task ? "start-requested" : "start-no-task";
+            LOGI("[PLANTING-CONTROL] start requested petal=%s task=%p", petal_id.c_str(), task);
+            write_planting_control_status(mode, false, planting_control_last_action.c_str(), petal_id);
+            return;
+        }
+        write_planting_control_status(mode, false, planting_control_last_action.c_str());
+        return;
+    }
+    if (mode == "off" && planting_control_owned && planting && !planting_control_stop_attempted) {
+        void *task = stop_planting_with_confirmation(planting_controller, false, nullptr);
+        if (task && gchandle_new) {
+            planting_control_pending_task = task;
+            planting_control_pending_task_handle = gchandle_new(task, false);
+        }
+        planting_control_stop_attempted = true;
+        planting_control_last_action = task ? "stop-requested" : "stop-no-task";
+        LOGI("[PLANTING-CONTROL] stop requested task=%p", task);
+        write_planting_control_status(mode, true, planting_control_last_action.c_str());
+        return;
+    }
+    if (mode == "off" && planting_control_owned && !planting) {
+        planting_control_owned = false;
+        planting_control_last_action = "stopped";
+    } else if (mode == "off" && !planting_control_owned) {
+        planting_control_last_action = planting ? "manual-session-preserved" : "off";
+    } else if (mode == "observe") {
+        planting_control_last_action = planting ? "observed-active" : "observe";
+    }
+    write_planting_control_status(mode, planting, planting_control_last_action.c_str());
+}
+
 bool current_location(double &latitude, double &longitude) {
     void *candidates[3]{location_controller, nullptr, nullptr};
     if (interaction_settings) {
@@ -2069,6 +2188,7 @@ void maybe_claim() {
     const bool online = network_available();
     const bool planting = is_planting();
     write_status(mode, online, planting);
+    maybe_manage_planting();
     maybe_return_tasks();
     if (mode != "test_once" && mode != "auto") return;
     if (mode == "test_once" && test_once_sent) return;
@@ -2477,7 +2597,20 @@ void hooked_planting_init(void *self, void *method_info) {
     planting_controller = self;
     if (self && !planting_controller_metadata_logged && object_get_class) {
         planting_controller_metadata_logged = true;
-        log_class_methods("PlantingController", object_get_class(self));
+        void *klass = object_get_class(self);
+        log_class_methods("PlantingController", klass);
+        void *petal_method = klass ? class_get_method_from_name(klass, "get_FlowerPetalId", 0) : nullptr;
+        void *start_method = klass ? class_get_method_from_name(klass, "StartPlantingWithConfirmationAsync", 2) : nullptr;
+        void *stop_method = klass ? class_get_method_from_name(klass, "StopPlantingWithConfirmationAsync", 1) : nullptr;
+        get_planting_flower_petal_id = petal_method
+                ? reinterpret_cast<GetManagedString>(*reinterpret_cast<void **>(petal_method)) : nullptr;
+        start_planting_with_confirmation = start_method
+                ? reinterpret_cast<StartPlantingWithConfirmation>(*reinterpret_cast<void **>(start_method)) : nullptr;
+        stop_planting_with_confirmation = stop_method
+                ? reinterpret_cast<StopPlantingWithConfirmation>(*reinterpret_cast<void **>(stop_method)) : nullptr;
+        LOGI("[PLANTING-CONTROL] methods petal=%p start=%p stop=%p",
+             get_planting_flower_petal_id, start_planting_with_confirmation,
+             stop_planting_with_confirmation);
     }
 }
 void hooked_planting_start(void *self, void *method_info) {
@@ -2556,6 +2689,8 @@ void start(const char *game_data_dir) {
     std::snprintf(dispatch_rpc_fault_path, sizeof(dispatch_rpc_fault_path), "%s/files/dispatch_rpc_faults.tsv", game_data_dir);
     std::snprintf(dispatch_gate_block_path, sizeof(dispatch_gate_block_path), "%s/files/dispatch_gate_blocks.tsv", game_data_dir);
     std::snprintf(dispatch_tick_trace_path, sizeof(dispatch_tick_trace_path), "%s/files/dispatch_tick_trace.tsv", game_data_dir);
+    std::snprintf(planting_control_mode_path, sizeof(planting_control_mode_path), "/data/local/tmp/pikmin-planting-mode.txt");
+    std::snprintf(planting_control_status_path, sizeof(planting_control_status_path), "%s/files/planting_control_status.tsv", game_data_dir);
     request_constructor = reinterpret_cast<RequestConstructor>(base + kRequestConstructorRva);
     request_set_map_object_id = reinterpret_cast<RequestSetString>(base + kRequestSetMapObjectIdRva);
     request_set_include_failure = reinterpret_cast<RequestSetBool>(base + kRequestSetIncludeFailureRva);
