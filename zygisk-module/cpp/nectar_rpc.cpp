@@ -250,6 +250,7 @@ char system_gps_path[512]{};
 // service.sh rewrites the system GPS file every two seconds, so anything older
 // than this means its loop is not running and the contents cannot be trusted.
 constexpr long long kSystemGpsMaxAgeSeconds = 15;
+constexpr int kMaxPikminTaskListCount = 512;
 long long last_stale_gps_age_logged = -1;
 char return_trace_path[512]{};
 char return_history_path[512]{};
@@ -308,6 +309,7 @@ long long last_claim_ms{};
 long long last_status_ms{};
 long long last_task_list_trace_ms{};
 long long last_return_dry_run_ms{};
+long long last_return_scheduler_ms{};
 long long last_expedition_duration_observed_ms{};
 bool test_once_sent{};
 bool target_loaded{};
@@ -364,6 +366,7 @@ void append_dispatch_gate_block(const std::string &task_id, const char *kind, bo
                                 double distance, double allowed_distance);
 void append_dispatch_tick_trace(const std::string &batch_target, bool target_seen_raw,
                                 int raw_count, int filtered_count);
+void maybe_return_tasks();
 
 std::string utf8_string(void *value) {
     if (!value) return {};
@@ -401,6 +404,17 @@ void append_return_history(const char *event, int task_count, int completed,
                  return_batch_pending_reward.c_str());
     std::fclose(file);
     chmod(return_history_path, 0644);
+}
+
+bool task_list_contains_id(void *items, int count, const std::string &target_id) {
+    if (!items || target_id.empty()) return false;
+    for (int index = 0; index < count; ++index) {
+        void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
+        if (!task || !get_inventory_item_id) continue;
+        void *task_id = get_inventory_item_id(task, nullptr);
+        if (utf8_string(task_id) == target_id) return true;
+    }
+    return false;
 }
 
 const char *fruit_type_name(int type) {
@@ -731,7 +745,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     auto *bytes = static_cast<uint8_t *>(list);
     void *items = *reinterpret_cast<void **>(bytes + 0x10);
     const int count = *reinterpret_cast<int *>(bytes + 0x18);
-    if (!items || count < 0 || count > 128) return;
+    if (!items || count < 0 || count > kMaxPikminTaskListCount) return;
     FILE *file = std::fopen(dispatch_candidates_path, "w");
     if (!file) return;
     double current_latitude{}, current_longitude{};
@@ -1065,7 +1079,7 @@ void *hooked_get_pikmin_task_list(void *self, void *method_info) {
     auto *bytes = static_cast<uint8_t *>(result);
     void *items = *reinterpret_cast<void **>(bytes + 0x10);
     const int count = *reinterpret_cast<int *>(bytes + 0x18);
-    if (!items || count < 0 || count > 128) {
+    if (!items || count < 0 || count > kMaxPikminTaskListCount) {
         LOGE("[RETURN-DIAG] task-list invalid self=%p list=%p count=%d", self, result, count);
         return result;
     }
@@ -1137,16 +1151,29 @@ int64_t hooked_get_expedition_total_duration_ms(void *self, void *method_info) {
 // predicate about each live inventory task and only writes diagnostics.
 void dry_run_return_tasks() {
     const long long now = now_ms();
-    if (!return_preparer || !return_inventory_manager || !original_get_pikmin_task_list ||
-        !original_should_prepare_completion || !get_inventory_item_id ||
-        now - last_return_dry_run_ms < 5000) return;
+    if (now - last_return_dry_run_ms < 5000) return;
     last_return_dry_run_ms = now;
+    if (!return_preparer || !return_inventory_manager || !original_get_pikmin_task_list ||
+        !original_should_prepare_completion || !get_inventory_item_id) {
+        LOGI("[RETURN-DIAG] dry-run waiting preparer=%p inventory=%p taskList=%p shouldPrepare=%p getId=%p",
+             return_preparer, return_inventory_manager,
+             reinterpret_cast<void *>(original_get_pikmin_task_list),
+             reinterpret_cast<void *>(original_should_prepare_completion),
+             reinterpret_cast<void *>(get_inventory_item_id));
+        return;
+    }
     void *list = original_get_pikmin_task_list(return_inventory_manager, nullptr);
-    if (!list) return;
+    if (!list) {
+        LOGI("[RETURN-DIAG] dry-run task-list null inventory=%p", return_inventory_manager);
+        return;
+    }
     write_dispatch_candidates(list, now);
     void *items = *reinterpret_cast<void **>(static_cast<uint8_t *>(list) + 0x10);
     const int count = *reinterpret_cast<int *>(static_cast<uint8_t *>(list) + 0x18);
-    if (!items || count < 0 || count > 128) return;
+    if (!items || count < 0 || count > kMaxPikminTaskListCount) {
+        LOGI("[RETURN-DIAG] dry-run invalid list=%p items=%p count=%d", list, items, count);
+        return;
+    }
     int ready_count{};
     int due_count{};
     for (int index = 0; index < count; ++index) {
@@ -1936,6 +1963,7 @@ void maybe_claim() {
     const bool online = network_available();
     const bool planting = is_planting();
     write_status(mode, online, planting);
+    maybe_return_tasks();
     if (mode != "test_once" && mode != "auto") return;
     if (mode == "test_once" && test_once_sent) return;
     if (pending_task) return;
@@ -2069,6 +2097,7 @@ void hooked_flower_model_updated(void *self, void *method_info) {
     // Update method.  Run the same mode-gated heartbeat here so diagnostic
     // status and opt-in automation both see those observations.
     maybe_claim();
+    maybe_return_tasks();
 }
 void hooked_rpc_manager_constructor(void *self, void *method_info) {
     if (original_rpc_manager_constructor) original_rpc_manager_constructor(self, method_info);
@@ -2090,6 +2119,7 @@ void hooked_register_map_object(void *self, void *map_object, int tag, void *met
     initialize_runtime_metadata();
     log_flower(map_object);
     maybe_claim();
+    maybe_return_tasks();
 }
 
 std::string read_return_mode() {
@@ -2193,9 +2223,10 @@ void maybe_dispatch_one_return_task() {
     if (!list) return;
     void *items = *reinterpret_cast<void **>(static_cast<uint8_t *>(list) + 0x10);
     const int count = *reinterpret_cast<int *>(static_cast<uint8_t *>(list) + 0x18);
-    if (!items || count < 0 || count > 128) return;
+    if (!items || count < 0 || count > kMaxPikminTaskListCount) return;
     if (return_one_waiting) {
-        if (count < return_one_baseline_count) {
+        const bool pending_seen = task_list_contains_id(items, count, return_batch_pending_id);
+        if (count < return_one_baseline_count || !pending_seen) {
             return_one_waiting = false;
             write_return_status("one-confirmed", count, 1, false, return_discard_postcard());
             return_batch_pending_id.clear();
@@ -2264,10 +2295,11 @@ void maybe_dispatch_return_batch() {
     if (!list) return;
     void *items = *reinterpret_cast<void **>(static_cast<uint8_t *>(list) + 0x10);
     const int count = *reinterpret_cast<int *>(static_cast<uint8_t *>(list) + 0x18);
-    if (!items || count < 0 || count > 128) return;
+    if (!items || count < 0 || count > kMaxPikminTaskListCount) return;
     const long long now = now_ms();
     if (return_batch_waiting) {
-        if (count < return_batch_baseline_count) {
+        const bool pending_seen = task_list_contains_id(items, count, return_batch_pending_id);
+        if (count < return_batch_baseline_count || !pending_seen) {
             return_batch_waiting = false;
             ++return_batch_completed;
             LOGI("[RETURN-DIAG] batch confirmed completed=%d", return_batch_completed);
@@ -2275,9 +2307,10 @@ void maybe_dispatch_return_batch() {
                                 return_discard_postcard());
             return_batch_pending_id.clear();
             return_batch_pending_reward.clear();
-        } else if (now - return_batch_dispatched_ms > 20000) {
+        } else if (now - return_batch_dispatched_ms > 60000) {
             return_batch_stopped = true;
-            LOGE("[RETURN-DIAG] batch stopped: inventory did not update within 20s");
+            LOGE("[RETURN-DIAG] batch stopped: pending task still present after 60s id=%s count=%d baseline=%d",
+                 return_batch_pending_id.c_str(), count, return_batch_baseline_count);
             write_return_status("batch-stopped-timeout", count, return_batch_completed, true,
                                 return_discard_postcard());
         }
@@ -2319,12 +2352,19 @@ void maybe_dispatch_return_batch() {
                             return_discard_postcard());
     }
 }
-void hooked_map_update(void *self, void *method_info) {
-    if (original_map_update) original_map_update(self, method_info);
-    maybe_claim();
+void maybe_return_tasks() {
+    const long long current = now_ms();
+    if (current - last_return_scheduler_ms < 1000) return;
+    last_return_scheduler_ms = current;
     dry_run_return_tasks();
     maybe_dispatch_one_return_task();
     maybe_dispatch_return_batch();
+}
+
+void hooked_map_update(void *self, void *method_info) {
+    if (original_map_update) original_map_update(self, method_info);
+    maybe_claim();
+    maybe_return_tasks();
 }
 void hooked_planting_init(void *self, void *method_info) {
     if (original_planting_init) original_planting_init(self, method_info);
