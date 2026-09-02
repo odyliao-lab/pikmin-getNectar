@@ -47,7 +47,9 @@ module 會驗證 `libil2cpp.so` 檔案大小；不相符時不安裝 hooks。其
 
 原生 module 另讀取 `/data/local/tmp/pikmin-planting-mode.txt`：`on` 會使用遊戲目前選取的花瓣，呼叫遊戲自身的 `StartPlantingWithConfirmationAsync(..., false)`；`off` 只會停止由 module 自己啟動的種花，絕不停止玩家原本手動開始的 session。缺少或未知值一律只是觀察，不會改變種花狀態。狀態寫到 `files/planting_control_status.tsv`。
 
-開始／停止已於 Pikmin Bloom v152 實機驗證：沿用目前選取的花瓣進入種花中，`off` 後回報已停止。對 module 自己停止的 session，會等待並以遊戲原生的結算視窗關閉方法收尾；不使用 Accessibility 或畫面座標。它尚不包含 GPS 跳點、停留時間或兩輪排程；不要將它視為已完成的花田採果。
+開始／停止已於 Pikmin Bloom v152 實機驗證：沿用目前選取的花瓣進入種花中，`off` 後回報已停止。對 module 自己停止的 session，會等待並以遊戲原生的結算視窗關閉方法收尾；不使用 Accessibility 或畫面座標。
+
+Control Center 的花田兩輪服務會在整段工作期間額外寫入 `/data/local/tmp/pikmin-flower-farm-mode.txt=on`。只有這個顯式 session 存在時，module 才會以遊戲自己的 `Task.CompletedTask` 抑制 `SpeedMonitor` 的速度警告**視窗**；它不改變 GPS、`IsPlayerSpeeding` 或遊戲／伺服器的速度限制判定。此 hook 已在 v152 build 安裝，仍待下一輪有效花田確認實際提示不再出現。GPS 跳點、停留時間與兩輪排程仍屬於 Control Center，不是本 module 單獨提供的功能。
 
 ## 安裝
 
