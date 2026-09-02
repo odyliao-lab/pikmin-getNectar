@@ -46,7 +46,7 @@ module 會驗證 `libil2cpp.so` 檔案大小；不相符時不安裝 hooks。其
 
 原生 module 另讀取 `/data/local/tmp/pikmin-planting-mode.txt`：`on` 會使用遊戲目前選取的花瓣，呼叫遊戲自身的 `StartPlantingWithConfirmationAsync(..., false)`；`off` 只會停止由 module 自己啟動的種花，絕不停止玩家原本手動開始的 session。缺少或未知值一律只是觀察，不會改變種花狀態。狀態寫到 `files/planting_control_status.tsv`。
 
-這是花田採果迴圈的底層開始／停止介面，尚不包含 GPS 跳點、停留時間或兩輪排程；在實機確認前不要將它視為已完成的花田採果。
+開始／停止已於 Pikmin Bloom v152 實機驗證：沿用目前選取的花瓣進入種花中，`off` 後回報已停止。它尚不包含 GPS 跳點、停留時間或兩輪排程；不要將它視為已完成的花田採果。
 
 ## 安裝
 
