@@ -269,7 +269,7 @@ char dispatch_candidates_path[512]{};
 char dispatch_status_path[512]{};
 char dispatch_mode_path[512]{};
 // Optional restriction for armed mode. Missing/unknown means all existing
-// kinds remain eligible; the flower-farm controller explicitly writes fruit.
+// kinds remain eligible; the flower-farm controller explicitly writes farm.
 char dispatch_kinds_path[512]{};
 char dispatch_target_path[512]{};
 char dispatch_ready_path[512]{};
@@ -936,7 +936,8 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         // live scan. Batch mode is stricter: the Control Center must name this
         // exact task and prove a fresh five-second arrival gate before any game
         // API is invoked. The native side rechecks the live game location.
-        const bool armed_kind_allowed = armed_kind_filter == "all" || armed_kind_filter == kind;
+        const bool armed_kind_allowed = armed_kind_filter == "all" || armed_kind_filter == kind ||
+                (armed_kind_filter == "farm" && (std::strcmp(kind, "fruit") == 0 || std::strcmp(kind, "seed") == 0));
         const bool requested = (armed && armed_kind_allowed) || (batch_ready && id_text == batch_target);
         // Control Center's own arrival gate already requires this same
         // distance column within 4 m (agreeing with the provider) for two
@@ -2388,7 +2389,7 @@ std::string read_dispatch_kind_filter() {
     std::fclose(file);
     std::string result(value);
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r' || result.back() == ' ')) result.pop_back();
-    return (result == "seed" || result == "fruit" || result == "gift") ? result : "all";
+    return (result == "seed" || result == "fruit" || result == "gift" || result == "farm") ? result : "all";
 }
 
 std::string read_dispatch_target() {

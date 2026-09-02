@@ -37,7 +37,7 @@ module 會驗證 `libil2cpp.so` 檔案大小；不相符時不安裝 hooks。其
 ### 控制檔
 
 - `/data/local/tmp/pikmin-dispatch-mode.txt`：`off`、`armed` 或 `batch`。
-- `/data/local/tmp/pikmin-dispatch-kinds.txt`：可選的 armed 篩選器：`seed`、`fruit` 或 `gift`；缺少或未知值等同 `all`，不改變既有 armed 行為。批次模式不使用此檔。
+- `/data/local/tmp/pikmin-dispatch-kinds.txt`：可選的 armed 篩選器：`seed`、`fruit`、`gift`，或花田用的 `farm`（水果＋花苗、排除禮物盒）；缺少或未知值等同 `all`，不改變既有 armed 行為。批次模式不使用此檔。
 - 批次模式另使用 target 與 ready 檔，只允許 Control Center 指定的一筆任務。
 - 模式檔權限必須是 `0644`。`0600 root` 會使遊戲注入行程讀不到檔案，module 會安全視為 `off`。
 
