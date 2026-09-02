@@ -333,6 +333,11 @@ bool return_bloomed_poi_fruit_entry_metadata_logged{};
 bool dispatch_enumerable_metadata_logged{};
 bool gift_pikmin_metadata_logged{};
 bool gift_target_metadata_logged{};
+// First step for the flower-farm controller: enumerate the actual v152
+// PlantingController methods once, without invoking any of them.  Starting or
+// stopping planting will not be attempted until this passive probe identifies
+// the game's real method contract.
+bool planting_controller_metadata_logged{};
 // Metadata-only, zero-invocation-risk probe for whether ExpeditionItemData
 // exposes a preparation/validation method (Lock*, Prepare*, Validate*, ...)
 // that the game's own UI might call before StartExpeditionAsync and that
@@ -2369,6 +2374,10 @@ void hooked_map_update(void *self, void *method_info) {
 void hooked_planting_init(void *self, void *method_info) {
     if (original_planting_init) original_planting_init(self, method_info);
     planting_controller = self;
+    if (self && !planting_controller_metadata_logged && object_get_class) {
+        planting_controller_metadata_logged = true;
+        log_class_methods("PlantingController", object_get_class(self));
+    }
 }
 void hooked_planting_start(void *self, void *method_info) {
     if (original_planting_start) original_planting_start(self, method_info);
