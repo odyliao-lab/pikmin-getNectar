@@ -283,11 +283,26 @@ char dispatch_tick_trace_path[512]{};
 std::string dispatch_confirmation_pending_id;
 long long dispatch_confirmation_started_observed_ms{};
 std::string dispatch_last_gift_skip_id;
-// The Task StartExpeditionAsync() returns is otherwise discarded, so a
-// dispatch that the game silently drops looks identical in the log to one
-// still in flight.  Root it and poll IsCompleted/IsFaulted -- the same
-// read-only pattern already used for the nectar claim Task below -- so the
-// history TSV records whether the RPC itself ever completed and how.
+// Batch mode deliberately owns one confirmation lock: its Java controller
+// must not advance to the next GPS point until this exact task is settled.
+// Armed mode is different.  A moving GPS provider can leave nearby targets
+// behind before a sequential confirmation finishes, so it may start a small
+// bounded group from one live task-list scan.  Keep every one of those calls
+// rooted and independently visible until the inventory confirms it.
+constexpr size_t kArmedMaxInFlight = 3;
+constexpr size_t kArmedMaxStartsPerScan = 3;
+struct ArmedDispatchInFlight {
+    void *task{};
+    uint32_t task_handle{};
+    std::string kind;
+    long long started_ms{};
+    long long ms_since_previous_attempt{-1};
+    bool rpc_result_recorded{};
+    bool seen_this_scan{};
+};
+std::map<std::string, ArmedDispatchInFlight> armed_dispatches;
+// Batch mode still has only one Task to watch.  This is deliberately not
+// shared with armed_dispatches so batch cannot accidentally parallelise.
 void *pending_expedition_task{};
 uint32_t pending_expedition_task_handle{};
 std::string pending_expedition_task_id;
@@ -765,6 +780,11 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         dispatch_confirmation_pending_id.clear();
         dispatch_confirmation_started_observed_ms = 0;
     }
+    // Turning armed mode off is an explicit controller release.  Do not keep
+    // stale in-memory ids across a later, independent armed run.  The rooted
+    // managed Tasks are intentionally not freed here: freeing a just-finished
+    // Task has raced an IL2CPP continuation on v150.
+    if (!armed && !armed_dispatches.empty()) armed_dispatches.clear();
     const std::string batch_target = batch ? read_dispatch_target() : "";
     const bool batch_ready = batch && !batch_target.empty() &&
             dispatch_target_is_ready(batch_target, observed_ms);
@@ -776,7 +796,8 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     int direct_seed_targets{}, direct_fruit_targets{}, gift_targets{}, bloomed_poi_targets{}, other_targets{};
     std::map<int, int> target_cases;
     std::map<int, int> unfinished_target_cases;
-    bool selection_applied{};
+    int selections_applied{};
+    int starts_requested{};
     bool start_requested{};
     bool pending_confirmation_seen{};
     // Whether this tick's raw list (before any of the continue-filters
@@ -787,6 +808,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     // identical from the Java side (both show as a silent stretch ending
     // in game-refresh-timeout).
     bool batch_target_seen_raw{};
+    for (auto &entry : armed_dispatches) entry.second.seen_this_scan = false;
     for (int index = 0; index < count; ++index) {
         void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
         void *proto = task ? get_pikmin_task_proto(task, nullptr) : nullptr;
@@ -817,11 +839,17 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         if (batch && !batch_target.empty() && id_text == batch_target) batch_target_seen_raw = true;
         if (confirmation_due && id_text == dispatch_confirmation_pending_id)
             pending_confirmation_seen = true;
+        auto armed_inflight = armed_dispatches.find(id_text);
+        if (armed_inflight != armed_dispatches.end()) armed_inflight->second.seen_this_scan = true;
         if (finish_ms != 0) {
             if (confirmation_due && id_text == dispatch_confirmation_pending_id) {
                 append_dispatch_history("inventory-confirmed", kind, id_text, 0, 0);
                 dispatch_confirmation_pending_id.clear();
                 dispatch_confirmation_started_observed_ms = 0;
+            }
+            if (armed_inflight != armed_dispatches.end()) {
+                append_dispatch_history("inventory-confirmed", kind, id_text, 0, 0);
+                armed_dispatches.erase(armed_inflight);
             }
             continue;
         }
@@ -880,12 +908,8 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
             LOGI("[GIFT-DIAG] task=%s gamePickerCount=%d; eligibility delegated to ExpeditionItemData.Allows",
                  id_text.c_str(), picked_count);
         }
-        // Phase two: when armed, update exactly one nearby task with the
-        // game's own fastest team.  This still does not start an expedition;
-        // it establishes the real duration and CanTryStart state that the
-        // final dispatch gate will require.
-        // Legacy armed mode retains the previously validated nearby single-task
-        // behaviour. Batch mode is stricter: the Control Center must name this
+        // Armed mode may start a bounded group of nearby tasks from this one
+        // live scan. Batch mode is stricter: the Control Center must name this
         // exact task and prove a fresh five-second arrival gate before any game
         // API is invoked. The native side rechecks the live game location.
         const bool requested = armed || (batch_ready && id_text == batch_target);
@@ -903,7 +927,12 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         // same distance reading, at the user's request for a literal radius
         // instead of an indirect time estimate.
         const double allowed_distance = batch ? 4.0 : 200.0;
-        if (dispatch_confirmation_pending_id.empty() && requested && !selection_applied && data && picked &&
+        const bool armed_capacity_available = armed &&
+                armed_dispatches.size() < kArmedMaxInFlight &&
+                starts_requested < static_cast<int>(kArmedMaxStartsPerScan) &&
+                armed_inflight == armed_dispatches.end();
+        const bool batch_capacity_available = batch && dispatch_confirmation_pending_id.empty();
+        if ((armed_capacity_available || batch_capacity_available) && requested && data && picked &&
             picked_count > 0 && set_expedition_pikmins &&
             distance >= 0.0 && distance <= allowed_distance) {
             // The picker calls ExpeditionItemData.Allows for every candidate.
@@ -919,7 +948,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                         ? get_expedition_can_try_start(data, nullptr) : can_start;
                 const bool carrying_power_after = get_expedition_has_enough_carrying_power
                         ? get_expedition_has_enough_carrying_power(data, nullptr) : true;
-                selection_applied = true;
+                ++selections_applied;
                 LOGI("[DISPATCH-OBSERVE] armed selection task=%s duration=%" PRId64 " canStart=%d picked=%d carryingPower=%d",
                      id_text.c_str(), game_duration, can_start ? 1 : 0, picked_count, carrying_power_after ? 1 : 0);
                 // distance is already <= allowed_distance here (checked above),
@@ -942,9 +971,22 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                     const int64_t finish_after = get_task_finish_time_ms
                             ? get_task_finish_time_ms(task, nullptr) : 0;
                     start_requested = true;
-                    dispatch_confirmation_pending_id = id_text;
-                    dispatch_confirmation_started_observed_ms = observed_ms;
-                    if (start_result && gchandle_new) {
+                    ++starts_requested;
+                    if (batch) {
+                        dispatch_confirmation_pending_id = id_text;
+                        dispatch_confirmation_started_observed_ms = observed_ms;
+                    } else {
+                        ArmedDispatchInFlight in_flight{};
+                        in_flight.task = start_result;
+                        in_flight.task_handle = start_result && gchandle_new
+                                ? gchandle_new(start_result, false) : 0;
+                        in_flight.kind = kind;
+                        in_flight.started_ms = now_ms();
+                        in_flight.ms_since_previous_attempt = pending_expedition_ms_since_previous_attempt;
+                        in_flight.seen_this_scan = true;
+                        armed_dispatches.emplace(id_text, std::move(in_flight));
+                    }
+                    if (batch && start_result && gchandle_new) {
                         pending_expedition_task = start_result;
                         pending_expedition_task_handle = gchandle_new(start_result, false);
                         pending_expedition_task_id = id_text;
@@ -1014,6 +1056,18 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         dispatch_confirmation_pending_id.clear();
         dispatch_confirmation_started_observed_ms = 0;
     }
+    // A complete task-list projection that no longer contains an armed call
+    // is the same inventory confirmation used by batch mode, but evaluated
+    // independently for every concurrent armed start.
+    for (auto it = armed_dispatches.begin(); it != armed_dispatches.end();) {
+        if (!it->second.seen_this_scan) {
+            append_dispatch_history("inventory-confirmed-absent", it->second.kind.c_str(),
+                                    it->first, 0, 0);
+            it = armed_dispatches.erase(it);
+        } else {
+            ++it;
+        }
+    }
     std::fclose(file);
     chmod(dispatch_candidates_path, 0644);
     FILE *status = std::fopen(dispatch_status_path, "w");
@@ -1021,7 +1075,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     std::fprintf(status, "%lld\t%s\t%d\t%s\n", observed_ms,
                  armed ? "armed" : (batch ? "batch" : "observed"), candidates,
                  start_requested ? "start-requested" :
-                 (selection_applied ? "selection-applied" :
+                 (selections_applied > 0 ? "selection-applied" :
                   (batch && !batch_ready ? "awaiting-arrival-gate" : "no-dispatch")));
     std::fclose(status);
     chmod(dispatch_status_path, 0644);
@@ -1942,6 +1996,52 @@ void poll_pending_expedition_task() {
     pending_expedition_task = nullptr;
 }
 
+// Armed mode can have several StartExpeditionAsync calls in flight at once.
+// Poll each independently; a completed successful RPC remains in the map
+// until the inventory projection confirms that task, while a fault releases
+// only its own id for a later retry.  Batch continues to use the single-task
+// watcher above so its GPS controller cannot advance early.
+void poll_armed_expedition_tasks() {
+    for (auto it = armed_dispatches.begin(); it != armed_dispatches.end();) {
+        ArmedDispatchInFlight &pending = it->second;
+        if (!pending.task || pending.rpc_result_recorded) {
+            ++it;
+            continue;
+        }
+        if (!task_is_completed || !task_is_completed(pending.task, nullptr)) {
+            if (now_ms() - pending.started_ms > 30000) {
+                LOGW("[DISPATCH-RPC] armed task=%s not completed after 30s; retaining inventory watch",
+                     it->first.c_str());
+                // Do not re-start a request whose managed Task may still run.
+                // Inventory confirmation remains the only release path.
+                pending.task = nullptr;
+            }
+            ++it;
+            continue;
+        }
+        const bool faulted = task_is_faulted && task_is_faulted(pending.task, nullptr);
+        const int64_t elapsed_ms = now_ms() - pending.started_ms;
+        const std::string exception_text = faulted ? read_task_exception_message(pending.task) : std::string();
+        consecutive_expedition_rpc_faults = faulted ? consecutive_expedition_rpc_faults + 1 : 0;
+        LOGI("[DISPATCH-RPC] armed task=%s completed faulted=%d elapsedMs=%" PRId64 " streak=%d exception=%s",
+             it->first.c_str(), faulted ? 1 : 0, elapsed_ms, consecutive_expedition_rpc_faults,
+             exception_text.empty() ? "-" : exception_text.c_str());
+        append_dispatch_history(faulted ? "start-rpc-faulted" : "start-rpc-completed",
+                                pending.kind.c_str(), it->first, elapsed_ms, 0);
+        append_rpc_fault_diagnostics(it->first, pending.kind.c_str(), faulted,
+                                     elapsed_ms, pending.ms_since_previous_attempt,
+                                     consecutive_expedition_rpc_faults, exception_text);
+        if (faulted) {
+            // A faulted request leaves no expedition in the inventory, so its
+            // own entry must be released. Other armed starts stay protected.
+            it = armed_dispatches.erase(it);
+        } else {
+            pending.rpc_result_recorded = true;
+            ++it;
+        }
+    }
+}
+
 void write_status(const std::string &mode, bool online, bool planting) {
     double latitude{}, longitude{};
     const bool has_location = current_location(latitude, longitude);
@@ -1965,6 +2065,7 @@ void maybe_claim() {
     const std::string mode = read_mode();
     poll_pending_task();
     poll_pending_expedition_task();
+    poll_armed_expedition_tasks();
     const bool online = network_available();
     const bool planting = is_planting();
     write_status(mode, online, planting);
