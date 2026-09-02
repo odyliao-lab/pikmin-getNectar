@@ -268,6 +268,9 @@ char compatibility_path[512]{};
 char dispatch_candidates_path[512]{};
 char dispatch_status_path[512]{};
 char dispatch_mode_path[512]{};
+// Optional restriction for armed mode. Missing/unknown means all existing
+// kinds remain eligible; the flower-farm controller explicitly writes fruit.
+char dispatch_kinds_path[512]{};
 char dispatch_target_path[512]{};
 char dispatch_ready_path[512]{};
 char dispatch_history_path[512]{};
@@ -394,6 +397,7 @@ void log_task_variant_metadata(void *proto);
 bool current_location(double &latitude, double &longitude);
 double distance_metres(double lat1, double lng1, double lat2, double lng2);
 std::string read_dispatch_mode();
+std::string read_dispatch_kind_filter();
 std::string read_planting_control_mode();
 std::string read_dispatch_target();
 bool dispatch_target_is_ready(const std::string &target_id, long long observed_ms);
@@ -792,6 +796,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     const std::string dispatch_mode = read_dispatch_mode();
     const bool armed = dispatch_mode == "armed";
     const bool batch = dispatch_mode == "batch";
+    const std::string armed_kind_filter = armed ? read_dispatch_kind_filter() : "all";
     // A controller stop is an explicit safety release.  Do not let a failed
     // or timed-out prior batch leave an in-memory confirmation lock that
     // blocks every later, independently armed batch.
@@ -931,7 +936,8 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         // live scan. Batch mode is stricter: the Control Center must name this
         // exact task and prove a fresh five-second arrival gate before any game
         // API is invoked. The native side rechecks the live game location.
-        const bool requested = armed || (batch_ready && id_text == batch_target);
+        const bool armed_kind_allowed = armed_kind_filter == "all" || armed_kind_filter == kind;
+        const bool requested = (armed && armed_kind_allowed) || (batch_ready && id_text == batch_target);
         // Control Center's own arrival gate already requires this same
         // distance column within 4 m (agreeing with the provider) for two
         // consecutive fresh scans before it ever authorises a batch dispatch,
@@ -2372,6 +2378,19 @@ std::string read_dispatch_mode() {
     return std::strncmp(value, "batch", 5) == 0 ? "batch" : "off";
 }
 
+// The filter is fail-open to preserve every existing armed workflow: only an
+// exact recognised value narrows candidates. Batch mode never consults it.
+std::string read_dispatch_kind_filter() {
+    FILE *file = std::fopen(dispatch_kinds_path, "r");
+    if (!file) return "all";
+    char value[16]{};
+    std::fgets(value, sizeof(value), file);
+    std::fclose(file);
+    std::string result(value);
+    while (!result.empty() && (result.back() == '\n' || result.back() == '\r' || result.back() == ' ')) result.pop_back();
+    return (result == "seed" || result == "fruit" || result == "gift") ? result : "all";
+}
+
 std::string read_dispatch_target() {
     FILE *file = std::fopen(dispatch_target_path, "r");
     if (!file) return {};
@@ -2682,6 +2701,7 @@ void start(const char *game_data_dir) {
     std::snprintf(dispatch_candidates_path, sizeof(dispatch_candidates_path), "%s/files/dispatch_candidates.tsv", game_data_dir);
     std::snprintf(dispatch_status_path, sizeof(dispatch_status_path), "%s/files/dispatch_probe_status.tsv", game_data_dir);
     std::snprintf(dispatch_mode_path, sizeof(dispatch_mode_path), "/data/local/tmp/pikmin-dispatch-mode.txt");
+    std::snprintf(dispatch_kinds_path, sizeof(dispatch_kinds_path), "/data/local/tmp/pikmin-dispatch-kinds.txt");
     std::snprintf(dispatch_target_path, sizeof(dispatch_target_path), "/data/local/tmp/pikmin-dispatch-target.txt");
     std::snprintf(dispatch_ready_path, sizeof(dispatch_ready_path), "/data/local/tmp/pikmin-dispatch-ready.tsv");
     std::snprintf(dispatch_history_path, sizeof(dispatch_history_path), "%s/files/dispatch_history.tsv", game_data_dir);
