@@ -1,6 +1,6 @@
 id=pikmin_nectar_rpc
 name=Pikmin Bloom Nectar RPC (v152)
-version=1.4.3
-versionCode=37
+version=1.4.4
+versionCode=38
 author=Codex + Ody
 description=Reads live Big Flowers and claims in-range nectar through the game's RPC without screen gestures.
