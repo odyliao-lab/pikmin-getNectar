@@ -229,6 +229,7 @@ GetExpeditionBool get_expedition_has_enough_carrying_power{};
 SimpleMethod invalidate_expedition_cached_values{};
 ExpeditionDataStoreConstructor original_expedition_data_store_constructor{};
 GetEnumerable get_pikmin_item_collection{};
+GetEnumerable get_expedition_pikmins{};
 PickFastestPikmins pick_fastest_pikmins{};
 SetExpeditionPikmins set_expedition_pikmins{};
 StartExpedition start_expedition{};
@@ -812,6 +813,40 @@ void *picked_pikmin_ids_array(void *enumerable, std::string *selected_ids, int *
     return array;
 }
 
+// get_Pikmins() returns IEnumerable<PikminInventoryItem>, not strings. Read
+// it with the same inventory-ID getter used by the native picker; this is a
+// passive comparison helper and never constructs or changes a team.
+std::string persisted_pikmin_ids(void *data, int *selected_count) {
+    if (selected_count) *selected_count = 0;
+    if (!data || !get_expedition_pikmins || !get_inventory_item_id ||
+        !object_get_virtual_method || !class_get_method_from_name) return {};
+    void *enumerable = get_expedition_pikmins(data, nullptr);
+    void *ienumerable = find_class("System.Collections", "IEnumerable");
+    void *ienumerator = find_class("System.Collections", "IEnumerator");
+    void *get_method = ienumerable ? class_get_method_from_name(ienumerable, "GetEnumerator", 0) : nullptr;
+    void *move_method = ienumerator ? class_get_method_from_name(ienumerator, "MoveNext", 0) : nullptr;
+    void *current_method = ienumerator ? class_get_method_from_name(ienumerator, "get_Current", 0) : nullptr;
+    void *get_impl = enumerable && get_method ? object_get_virtual_method(enumerable, get_method) : nullptr;
+    auto get_enumerator = get_impl ? reinterpret_cast<GetEnumerable>(*reinterpret_cast<void **>(get_impl)) : nullptr;
+    void *enumerator = get_enumerator ? get_enumerator(enumerable, nullptr) : nullptr;
+    void *move_impl = enumerator && move_method ? object_get_virtual_method(enumerator, move_method) : nullptr;
+    void *current_impl = enumerator && current_method ? object_get_virtual_method(enumerator, current_method) : nullptr;
+    auto move_next = move_impl ? reinterpret_cast<EnumeratorMoveNext>(*reinterpret_cast<void **>(move_impl)) : nullptr;
+    auto current = current_impl ? reinterpret_cast<EnumeratorCurrent>(*reinterpret_cast<void **>(current_impl)) : nullptr;
+    if (!enumerator || !move_next || !current) return {};
+    std::string ids;
+    int count{};
+    while (count < 100 && move_next(enumerator, nullptr)) {
+        if (count != 0) ids.push_back(',');
+        void *pikmin = current(enumerator, nullptr);
+        const std::string id = pikmin ? utf8_string(get_inventory_item_id(pikmin, nullptr)) : std::string{};
+        ids.append(id.empty() ? "<empty>" : id);
+        ++count;
+    }
+    if (selected_count) *selected_count = count;
+    return ids;
+}
+
 void log_dispatch_enumerable_metadata(void *object, const char *label) {
     if (!object || !object_get_class || !class_get_methods || !method_get_name || dispatch_enumerable_metadata_logged) return;
     dispatch_enumerable_metadata_logged = true;
@@ -1017,10 +1052,12 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 const bool settled_gate = requested && data && can_start && carrying_power_settled &&
                         start_expedition && distance >= 0.0 && distance <= allowed_distance;
                 if (settled_gate) {
+                    int persisted_count{};
+                    const std::string persisted_ids = persisted_pikmin_ids(data, &persisted_count);
                     append_dispatch_selection_diagnostics(kind, id_text, "pre-start-settled",
-                                                          batch_selection_settling_picked_count, 0,
+                                                          batch_selection_settling_picked_count, persisted_count,
                                                           game_duration, can_start,
-                                                          carrying_power_settled, "");
+                                                          carrying_power_settled, persisted_ids);
                     const long long attempt_now = now_ms();
                     pending_expedition_ms_since_previous_attempt = last_expedition_attempt_started_ms > 0
                             ? attempt_now - last_expedition_attempt_started_ms : -1;
@@ -1080,6 +1117,11 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 append_dispatch_selection_diagnostics(kind, id_text, "post-set", picked_count,
                                                       selected_id_count, game_duration, can_start,
                                                       carrying_power_after, selected_ids);
+                int persisted_count{};
+                const std::string persisted_ids = persisted_pikmin_ids(data, &persisted_count);
+                append_dispatch_selection_diagnostics(kind, id_text, "post-set-persisted", picked_count,
+                                                      persisted_count, game_duration, can_start,
+                                                      carrying_power_after, persisted_ids);
                 ++selections_applied;
                 LOGI("[DISPATCH-OBSERVE] armed selection task=%s duration=%" PRId64 " canStart=%d picked=%d carryingPower=%d",
                      id_text.c_str(), game_duration, can_start ? 1 : 0, picked_count, carrying_power_after ? 1 : 0);
@@ -1642,6 +1684,11 @@ void install_return_diagnostic_hook() {
             ? class_get_method_from_name(expedition_item_class, "SetPikmins", 1) : nullptr;
     set_expedition_pikmins = set_pikmins_method
             ? reinterpret_cast<SetExpeditionPikmins>(*reinterpret_cast<void **>(set_pikmins_method)) : nullptr;
+    void *pikmins_method = expedition_item_class
+            ? class_get_method_from_name(expedition_item_class, "get_Pikmins", 0) : nullptr;
+    get_expedition_pikmins = pikmins_method
+            ? reinterpret_cast<GetEnumerable>(*reinterpret_cast<void **>(pikmins_method)) : nullptr;
+    LOGI("[DISPATCH-OBSERVE] persisted PikminInventoryItem getter=%p", pikmins_method);
     void *start_expedition_method = expedition_item_class
             ? class_get_method_from_name(expedition_item_class, "StartExpeditionAsync", 0) : nullptr;
     start_expedition = start_expedition_method
