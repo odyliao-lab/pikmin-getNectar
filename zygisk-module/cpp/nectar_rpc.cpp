@@ -281,6 +281,9 @@ char dispatch_target_path[512]{};
 char dispatch_ready_path[512]{};
 char dispatch_history_path[512]{};
 char dispatch_diagnostics_path[512]{};
+// Exact values passed to ExpeditionItemData.SetPikmins. This is a short-lived
+// diagnostic capture for comparing the native selection with the game's UI.
+char dispatch_selection_diagnostics_path[512]{};
 // Forensic log for start_expedition() RPC faults -- see
 // append_rpc_fault_diagnostics() and read_task_exception_message() below.
 // Kept separate from dispatch_history.tsv so it never touches that file's
@@ -421,6 +424,10 @@ std::string read_dispatch_target();
 bool dispatch_target_is_ready(const std::string &target_id, long long observed_ms);
 void append_dispatch_history(const char *event, const char *kind, const std::string &task_id,
                              int64_t duration_ms, int picked_count);
+void append_dispatch_selection_diagnostics(const char *kind, const std::string &task_id,
+                                           const char *phase, int picker_count, int id_count,
+                                           int64_t duration_ms, bool can_try_start,
+                                           bool carrying_power, const std::string &ids);
 void log_class_methods(const char *label, void *proto_class);
 void append_dispatch_gate_block(const std::string &task_id, const char *kind, bool lock_held,
                                 bool requested, bool has_data, bool has_picked, int picked_count,
@@ -750,7 +757,9 @@ int count_enumerable_items(void *enumerable) {
 // The game's SetPikmins API accepts IEnumerable<string>.  A managed string[]
 // implements that interface, so it avoids fabricating a generic List<T> and
 // keeps the hand-off entirely inside the game's managed runtime.
-void *picked_pikmin_ids_array(void *enumerable) {
+void *picked_pikmin_ids_array(void *enumerable, std::string *selected_ids, int *selected_count) {
+    if (selected_ids) selected_ids->clear();
+    if (selected_count) *selected_count = 0;
     if (!enumerable || !object_get_class || !class_get_method_from_name ||
         !object_get_virtual_method || !get_inventory_item_id || !array_new) return nullptr;
     void *ienumerable = find_class("System.Collections", "IEnumerable");
@@ -778,11 +787,20 @@ void *picked_pikmin_ids_array(void *enumerable) {
         if (id) ids.push_back(id);
     }
     if (ids.empty()) return nullptr;
+    std::string ids_for_diagnostics;
+    for (size_t index = 0; index < ids.size(); ++index) {
+        if (index != 0) ids_for_diagnostics.push_back(',');
+        const std::string id_text = utf8_string(ids[index]);
+        ids_for_diagnostics.append(id_text.empty() ? "<empty>" : id_text);
+    }
     void *array = array_new(string_class, ids.size());
     if (!array) return nullptr;
     auto **values = reinterpret_cast<void **>(static_cast<uint8_t *>(array) + 0x20);
     for (size_t index = 0; index < ids.size(); ++index) values[index] = ids[index];
-    LOGI("[DISPATCH-OBSERVE] selected %zu Pikmin ids array=%p", ids.size(), array);
+    if (selected_ids) *selected_ids = ids_for_diagnostics;
+    if (selected_count) *selected_count = static_cast<int>(ids.size());
+    LOGI("[DISPATCH-OBSERVE] selected %zu Pikmin ids array=%p ids=%s", ids.size(), array,
+         ids_for_diagnostics.c_str());
     return array;
 }
 
@@ -983,7 +1001,9 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
             // For ordinary gifts that enforces Restriction.AllowedPikminId;
             // for rare-deco gifts it enforces AllowsRareDecoGift. Never
             // substitute a controller-chosen Pikmin.
-            void *ids = picked_pikmin_ids_array(picked);
+            std::string selected_ids;
+            int selected_id_count{};
+            void *ids = picked_pikmin_ids_array(picked, &selected_ids, &selected_id_count);
             if (ids) {
                 set_expedition_pikmins(data, ids, nullptr);
                 game_duration = original_get_expedition_total_duration_ms
@@ -992,6 +1012,9 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                         ? get_expedition_can_try_start(data, nullptr) : can_start;
                 const bool carrying_power_after = get_expedition_has_enough_carrying_power
                         ? get_expedition_has_enough_carrying_power(data, nullptr) : true;
+                append_dispatch_selection_diagnostics(kind, id_text, "post-set", picked_count,
+                                                      selected_id_count, game_duration, can_start,
+                                                      carrying_power_after, selected_ids);
                 ++selections_applied;
                 LOGI("[DISPATCH-OBSERVE] armed selection task=%s duration=%" PRId64 " canStart=%d picked=%d carryingPower=%d",
                      id_text.c_str(), game_duration, can_start ? 1 : 0, picked_count, carrying_power_after ? 1 : 0);
@@ -2486,6 +2509,40 @@ void append_dispatch_history(const char *event, const char *kind, const std::str
     chmod(dispatch_history_path, 0644);
 }
 
+// Retain exactly one day, matching dispatch_history.tsv. Values originate from
+// managed inventory IDs, but normalize TSV delimiters defensively.
+void append_dispatch_selection_diagnostics(const char *kind, const std::string &task_id,
+                                           const char *phase, int picker_count, int id_count,
+                                           int64_t duration_ms, bool can_try_start,
+                                           bool carrying_power, const std::string &ids) {
+    const long long cutoff = now_ms() - 24LL * 60 * 60 * 1000;
+    const std::string temporary = std::string(dispatch_selection_diagnostics_path) + ".tmp";
+    std::ifstream source(dispatch_selection_diagnostics_path);
+    std::ofstream retained(temporary, std::ios::trunc);
+    std::string line;
+    while (source && std::getline(source, line)) {
+        char *end{};
+        const long long timestamp = std::strtoll(line.c_str(), &end, 10);
+        if (end != line.c_str() && timestamp >= cutoff) retained << line << '\n';
+    }
+    source.close(); retained.close();
+    if (std::rename(temporary.c_str(), dispatch_selection_diagnostics_path) != 0) {
+        std::remove(temporary.c_str());
+    }
+    std::string safe_ids = ids;
+    for (char &value : safe_ids) {
+        if (value == '\t' || value == '\r' || value == '\n') value = '_';
+    }
+    FILE *file = std::fopen(dispatch_selection_diagnostics_path, "a");
+    if (!file) return;
+    std::fprintf(file, "%lld\t%s\t%s\t%s\t%d\t%d\t%" PRId64 "\t%d\t%d\t%s\n",
+                 now_ms(), kind, task_id.c_str(), phase, picker_count, id_count,
+                 duration_ms, can_try_start ? 1 : 0, carrying_power ? 1 : 0,
+                 safe_ids.c_str());
+    std::fclose(file);
+    chmod(dispatch_selection_diagnostics_path, 0644);
+}
+
 // The policy defaults to preserving postcards. Only the explicit "discard"
 // value changes the boolean passed to the game's native completion API.
 bool return_discard_postcard() {
@@ -2796,6 +2853,7 @@ void start(const char *game_data_dir) {
     std::snprintf(dispatch_ready_path, sizeof(dispatch_ready_path), "/data/local/tmp/pikmin-dispatch-ready.tsv");
     std::snprintf(dispatch_history_path, sizeof(dispatch_history_path), "%s/files/dispatch_history.tsv", game_data_dir);
     std::snprintf(dispatch_diagnostics_path, sizeof(dispatch_diagnostics_path), "%s/files/dispatch_diagnostics.tsv", game_data_dir);
+    std::snprintf(dispatch_selection_diagnostics_path, sizeof(dispatch_selection_diagnostics_path), "%s/files/dispatch_selection_diagnostics.tsv", game_data_dir);
     std::snprintf(dispatch_rpc_fault_path, sizeof(dispatch_rpc_fault_path), "%s/files/dispatch_rpc_faults.tsv", game_data_dir);
     std::snprintf(dispatch_gate_block_path, sizeof(dispatch_gate_block_path), "%s/files/dispatch_gate_blocks.tsv", game_data_dir);
     std::snprintf(dispatch_tick_trace_path, sizeof(dispatch_tick_trace_path), "%s/files/dispatch_tick_trace.tsv", game_data_dir);
