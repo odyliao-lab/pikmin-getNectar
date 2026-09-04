@@ -310,6 +310,14 @@ char flower_farm_mode_path[512]{};
 std::string dispatch_confirmation_pending_id;
 long long dispatch_confirmation_started_observed_ms{};
 std::string dispatch_last_gift_skip_id;
+// Batch dispatch runs on the game's update thread.  Do not block that thread
+// after SetPikmins(); instead, remember the exact target and re-check it on a
+// later live inventory tick before StartExpeditionAsync().
+constexpr long long kBatchSelectionSettleMs = 1500;
+std::string batch_selection_settling_id;
+std::string batch_selection_settling_kind;
+long long batch_selection_settling_started_ms{};
+int batch_selection_settling_picked_count{};
 // Batch mode deliberately owns one confirmation lock: its Java controller
 // must not advance to the next GPS point until this exact task is settled.
 // Armed mode is different.  A moving GPS provider can leave nearby targets
@@ -848,6 +856,12 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     const std::string batch_target = batch ? read_dispatch_target() : "";
     const bool batch_ready = batch && !batch_target.empty() &&
             dispatch_target_is_ready(batch_target, observed_ms);
+    if (!batch || batch_selection_settling_id != batch_target) {
+        batch_selection_settling_id.clear();
+        batch_selection_settling_kind.clear();
+        batch_selection_settling_started_ms = 0;
+        batch_selection_settling_picked_count = 0;
+    }
     const bool confirmation_due = !dispatch_confirmation_pending_id.empty() &&
             dispatch_confirmation_started_observed_ms < observed_ms;
     int candidates{};
@@ -994,7 +1008,58 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 starts_requested < static_cast<int>(kArmedMaxStartsPerScan) &&
                 armed_inflight == armed_dispatches.end();
         const bool batch_capacity_available = batch && dispatch_confirmation_pending_id.empty();
-        if ((armed_capacity_available || batch_capacity_available) && requested && data && picked &&
+        const bool batch_selection_pending = batch && !batch_selection_settling_id.empty();
+        if (batch_selection_pending) {
+            if (id_text == batch_selection_settling_id &&
+                observed_ms - batch_selection_settling_started_ms >= kBatchSelectionSettleMs) {
+                const bool carrying_power_settled = get_expedition_has_enough_carrying_power
+                        ? get_expedition_has_enough_carrying_power(data, nullptr) : true;
+                const bool settled_gate = requested && data && can_start && carrying_power_settled &&
+                        start_expedition && distance >= 0.0 && distance <= allowed_distance;
+                if (settled_gate) {
+                    append_dispatch_selection_diagnostics(kind, id_text, "pre-start-settled",
+                                                          batch_selection_settling_picked_count, 0,
+                                                          game_duration, can_start,
+                                                          carrying_power_settled, "");
+                    const long long attempt_now = now_ms();
+                    pending_expedition_ms_since_previous_attempt = last_expedition_attempt_started_ms > 0
+                            ? attempt_now - last_expedition_attempt_started_ms : -1;
+                    last_expedition_attempt_started_ms = attempt_now;
+                    void *start_result = start_expedition(data, nullptr);
+                    const bool can_start_after = get_expedition_can_try_start
+                            ? get_expedition_can_try_start(data, nullptr) : false;
+                    const int64_t finish_after = get_task_finish_time_ms
+                            ? get_task_finish_time_ms(task, nullptr) : 0;
+                    start_requested = true;
+                    ++starts_requested;
+                    dispatch_confirmation_pending_id = id_text;
+                    dispatch_confirmation_started_observed_ms = observed_ms;
+                    if (start_result && gchandle_new) {
+                        pending_expedition_task = start_result;
+                        pending_expedition_task_handle = gchandle_new(start_result, false);
+                        pending_expedition_task_id = id_text;
+                        pending_expedition_task_kind = kind;
+                        pending_expedition_task_started_ms = now_ms();
+                    }
+                    append_dispatch_history("start-requested", kind, id_text, game_duration,
+                                            batch_selection_settling_picked_count);
+                    LOGI("[DISPATCH] settled start task=%s waitedMs=%lld duration=%" PRId64
+                         " picked=%d result=%p canStartAfter=%d finishAfter=%" PRId64,
+                         id_text.c_str(), observed_ms - batch_selection_settling_started_ms,
+                         game_duration, batch_selection_settling_picked_count, start_result,
+                         can_start_after ? 1 : 0, finish_after);
+                } else {
+                    append_dispatch_history("selection-settle-blocked", kind, id_text,
+                                            game_duration, batch_selection_settling_picked_count);
+                    LOGI("[DISPATCH] settled start blocked task=%s canStart=%d carrying=%d distance=%.2f",
+                         id_text.c_str(), can_start ? 1 : 0, carrying_power_settled ? 1 : 0, distance);
+                }
+                batch_selection_settling_id.clear();
+                batch_selection_settling_kind.clear();
+                batch_selection_settling_started_ms = 0;
+                batch_selection_settling_picked_count = 0;
+            }
+        } else if ((armed_capacity_available || batch_capacity_available) && requested && data && picked &&
             picked_count > 0 && set_expedition_pikmins &&
             distance >= 0.0 && distance <= allowed_distance) {
             // The picker calls ExpeditionItemData.Allows for every candidate.
@@ -1024,6 +1089,19 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 // remaining game-side condition.
                 gift_pikmin_unavailable = is_gift && !can_start;
                 if (can_start && start_expedition) {
+                    if (batch) {
+                        // Do not call StartExpeditionAsync in the same update
+                        // turn as SetPikmins. The next live inventory tick
+                        // re-checks all native gates before it can start.
+                        batch_selection_settling_id = id_text;
+                        batch_selection_settling_kind = kind;
+                        batch_selection_settling_started_ms = observed_ms;
+                        batch_selection_settling_picked_count = picked_count;
+                        append_dispatch_history("selection-settling", kind, id_text,
+                                                game_duration, picked_count);
+                        LOGI("[DISPATCH] selection settling task=%s waitMs=%lld picked=%d",
+                             id_text.c_str(), kBatchSelectionSettleMs, picked_count);
+                    } else {
                     // Recorded before the call so a rate-limit hypothesis for
                     // the fault rate (see append_rpc_fault_diagnostics) can be
                     // checked against how soon this attempt followed the last
@@ -1064,6 +1142,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                     LOGI("[DISPATCH] start requested task=%s duration=%" PRId64 " picked=%d result=%p canStartAfter=%d finishAfter=%" PRId64,
                          id_text.c_str(), game_duration, picked_count, start_result,
                          can_start_after ? 1 : 0, finish_after);
+                    }
                 } else if (batch_ready && id_text == batch_target && gift_pikmin_unavailable &&
                            dispatch_last_gift_skip_id != id_text) {
                     // The designated ID exists, but the game rejected it (for
