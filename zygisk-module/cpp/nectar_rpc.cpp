@@ -231,7 +231,6 @@ ExpeditionDataStoreConstructor original_expedition_data_store_constructor{};
 GetEnumerable get_pikmin_item_collection{};
 PickFastestPikmins pick_fastest_pikmins{};
 SetExpeditionPikmins set_expedition_pikmins{};
-SetExpeditionPikmins original_set_expedition_pikmins{};
 StartExpedition start_expedition{};
 GetManagedString get_planting_flower_petal_id{};
 StartPlantingWithConfirmation start_planting_with_confirmation{};
@@ -285,11 +284,6 @@ char dispatch_diagnostics_path[512]{};
 // Exact values passed to ExpeditionItemData.SetPikmins. This is a short-lived
 // diagnostic capture for comparing the native selection with the game's UI.
 char dispatch_selection_diagnostics_path[512]{};
-// Observer-only capture of selections made through the game's own
-// ExpeditionItemData.SetPikmins entry point. Native dispatch continues to
-// call the original implementation directly, so this file is a comparison
-// record for the UI/game path, not an alternate dispatch mechanism.
-char dispatch_ui_selection_diagnostics_path[512]{};
 // Forensic log for start_expedition() RPC faults -- see
 // append_rpc_fault_diagnostics() and read_task_exception_message() below.
 // Kept separate from dispatch_history.tsv so it never touches that file's
@@ -434,8 +428,6 @@ void append_dispatch_selection_diagnostics(const char *kind, const std::string &
                                            const char *phase, int picker_count, int id_count,
                                            int64_t duration_ms, bool can_try_start,
                                            bool carrying_power, const std::string &ids);
-void append_dispatch_ui_selection_diagnostics(const std::string &task_id, int id_count,
-                                              const std::string &ids);
 void log_class_methods(const char *label, void *proto_class);
 void append_dispatch_gate_block(const std::string &task_id, const char *kind, bool lock_held,
                                 bool requested, bool has_data, bool has_picked, int picked_count,
@@ -810,37 +802,6 @@ void *picked_pikmin_ids_array(void *enumerable, std::string *selected_ids, int *
     LOGI("[DISPATCH-OBSERVE] selected %zu Pikmin ids array=%p ids=%s", ids.size(), array,
          ids_for_diagnostics.c_str());
     return array;
-}
-
-// SetPikmins takes IEnumerable<string>, unlike the native picker above which
-// returns Pikmin inventory objects. This is an observer-only enumeration of
-// the exact string IDs supplied by the game UI.
-std::string string_ids_from_enumerable(void *enumerable, int *selected_count) {
-    if (selected_count) *selected_count = 0;
-    if (!enumerable || !object_get_virtual_method || !class_get_method_from_name) return {};
-    void *ienumerable = find_class("System.Collections", "IEnumerable");
-    void *ienumerator = find_class("System.Collections", "IEnumerator");
-    void *get_method = ienumerable ? class_get_method_from_name(ienumerable, "GetEnumerator", 0) : nullptr;
-    void *move_method = ienumerator ? class_get_method_from_name(ienumerator, "MoveNext", 0) : nullptr;
-    void *current_method = ienumerator ? class_get_method_from_name(ienumerator, "get_Current", 0) : nullptr;
-    void *get_impl = get_method ? object_get_virtual_method(enumerable, get_method) : nullptr;
-    auto get_enumerator = get_impl ? reinterpret_cast<GetEnumerable>(*reinterpret_cast<void **>(get_impl)) : nullptr;
-    void *enumerator = get_enumerator ? get_enumerator(enumerable, nullptr) : nullptr;
-    void *move_impl = enumerator && move_method ? object_get_virtual_method(enumerator, move_method) : nullptr;
-    void *current_impl = enumerator && current_method ? object_get_virtual_method(enumerator, current_method) : nullptr;
-    auto move_next = move_impl ? reinterpret_cast<EnumeratorMoveNext>(*reinterpret_cast<void **>(move_impl)) : nullptr;
-    auto current = current_impl ? reinterpret_cast<EnumeratorCurrent>(*reinterpret_cast<void **>(current_impl)) : nullptr;
-    if (!enumerator || !move_next || !current) return {};
-    std::string ids;
-    int count{};
-    while (count < 100 && move_next(enumerator, nullptr)) {
-        if (count != 0) ids.push_back(',');
-        const std::string id = utf8_string(current(enumerator, nullptr));
-        ids.append(id.empty() ? "<empty>" : id);
-        ++count;
-    }
-    if (selected_count) *selected_count = count;
-    return ids;
 }
 
 void log_dispatch_enumerable_metadata(void *object, const char *label) {
@@ -1294,23 +1255,6 @@ void hooked_expedition_data_store_constructor(void *self, void *method_info) {
     LOGI("[DISPATCH-OBSERVE] expedition data store captured self=%p", self);
 }
 
-// This hook is deliberately passive. It gives us the game/UI's exact
-// IEnumerable<string> selection for a later manual comparison, then calls the
-// original method unchanged. Native automation bypasses this hook through
-// original_set_expedition_pikmins and remains separately logged.
-void hooked_set_expedition_pikmins(void *self, void *pikmin_ids, void *method_info) {
-    int id_count{};
-    const std::string ids = string_ids_from_enumerable(pikmin_ids, &id_count);
-    const std::string task_id = get_expedition_item_key
-            ? utf8_string(get_expedition_item_key(self, nullptr)) : std::string{};
-    append_dispatch_ui_selection_diagnostics(task_id, id_count, ids);
-    LOGI("[DISPATCH-UI] SetPikmins task=%s ids=%d values=%s", task_id.c_str(), id_count,
-         ids.empty() ? "<unresolved>" : ids.c_str());
-    if (original_set_expedition_pikmins) {
-        original_set_expedition_pikmins(self, pikmin_ids, method_info);
-    }
-}
-
 // The picker evaluates this after selecting its fastest valid Pikmin.  By
 // observing it we can use the game's own round-trip calculation, rather than
 // converting map distance to a guessed travel time.  This hook is read-only.
@@ -1617,19 +1561,8 @@ void install_return_diagnostic_hook() {
          carrying_power_method, invalidate_cached_method);
     void *set_pikmins_method = expedition_item_class
             ? class_get_method_from_name(expedition_item_class, "SetPikmins", 1) : nullptr;
-    void *set_pikmins_entry = set_pikmins_method
-            ? *reinterpret_cast<void **>(set_pikmins_method) : nullptr;
-    if (set_pikmins_entry) {
-        A64HookFunction(set_pikmins_entry, reinterpret_cast<void *>(hooked_set_expedition_pikmins),
-                        reinterpret_cast<void **>(&original_set_expedition_pikmins));
-        // Keep native automation on the trampoline, so its existing call path
-        // is unchanged and the UI observer never observes its own call.
-        set_expedition_pikmins = original_set_expedition_pikmins;
-        LOGI("[DISPATCH-UI] SetPikmins observer installed method=%p entry=%p original=%p",
-             set_pikmins_method, set_pikmins_entry, original_set_expedition_pikmins);
-    } else {
-        LOGE("[DISPATCH-UI] SetPikmins method not found; native dispatch disabled fail-closed");
-    }
+    set_expedition_pikmins = set_pikmins_method
+            ? reinterpret_cast<SetExpeditionPikmins>(*reinterpret_cast<void **>(set_pikmins_method)) : nullptr;
     void *start_expedition_method = expedition_item_class
             ? class_get_method_from_name(expedition_item_class, "StartExpeditionAsync", 0) : nullptr;
     start_expedition = start_expedition_method
@@ -2610,36 +2543,6 @@ void append_dispatch_selection_diagnostics(const char *kind, const std::string &
     chmod(dispatch_selection_diagnostics_path, 0644);
 }
 
-// Same 24-hour retention policy as the native-selection capture. This file is
-// intentionally independent so existing controller TSV readers are untouched.
-void append_dispatch_ui_selection_diagnostics(const std::string &task_id, int id_count,
-                                              const std::string &ids) {
-    const long long cutoff = now_ms() - 24LL * 60 * 60 * 1000;
-    const std::string temporary = std::string(dispatch_ui_selection_diagnostics_path) + ".tmp";
-    std::ifstream source(dispatch_ui_selection_diagnostics_path);
-    std::ofstream retained(temporary, std::ios::trunc);
-    std::string line;
-    while (source && std::getline(source, line)) {
-        char *end{};
-        const long long timestamp = std::strtoll(line.c_str(), &end, 10);
-        if (end != line.c_str() && timestamp >= cutoff) retained << line << '\n';
-    }
-    source.close(); retained.close();
-    if (std::rename(temporary.c_str(), dispatch_ui_selection_diagnostics_path) != 0) {
-        std::remove(temporary.c_str());
-    }
-    std::string safe_ids = ids;
-    for (char &value : safe_ids) {
-        if (value == '\t' || value == '\r' || value == '\n') value = '_';
-    }
-    FILE *file = std::fopen(dispatch_ui_selection_diagnostics_path, "a");
-    if (!file) return;
-    std::fprintf(file, "%lld\t%s\t%d\t%s\n", now_ms(), task_id.c_str(), id_count,
-                 safe_ids.c_str());
-    std::fclose(file);
-    chmod(dispatch_ui_selection_diagnostics_path, 0644);
-}
-
 // The policy defaults to preserving postcards. Only the explicit "discard"
 // value changes the boolean passed to the game's native completion API.
 bool return_discard_postcard() {
@@ -2951,7 +2854,6 @@ void start(const char *game_data_dir) {
     std::snprintf(dispatch_history_path, sizeof(dispatch_history_path), "%s/files/dispatch_history.tsv", game_data_dir);
     std::snprintf(dispatch_diagnostics_path, sizeof(dispatch_diagnostics_path), "%s/files/dispatch_diagnostics.tsv", game_data_dir);
     std::snprintf(dispatch_selection_diagnostics_path, sizeof(dispatch_selection_diagnostics_path), "%s/files/dispatch_selection_diagnostics.tsv", game_data_dir);
-    std::snprintf(dispatch_ui_selection_diagnostics_path, sizeof(dispatch_ui_selection_diagnostics_path), "%s/files/dispatch_ui_selection_diagnostics.tsv", game_data_dir);
     std::snprintf(dispatch_rpc_fault_path, sizeof(dispatch_rpc_fault_path), "%s/files/dispatch_rpc_faults.tsv", game_data_dir);
     std::snprintf(dispatch_gate_block_path, sizeof(dispatch_gate_block_path), "%s/files/dispatch_gate_blocks.tsv", game_data_dir);
     std::snprintf(dispatch_tick_trace_path, sizeof(dispatch_tick_trace_path), "%s/files/dispatch_tick_trace.tsv", game_data_dir);
