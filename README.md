@@ -36,8 +36,6 @@ module 會驗證 `libil2cpp.so` 檔案大小；不相符時不安裝 hooks。其
 
 若 `StartExpeditionAsync()` 回報 server fault，`files/dispatch_selection_diagnostics.tsv` 會保留最近 24 小時的診斷列：時間、任務種類與 ID、`SetPikmins` 後的遊戲狀態、picker 數量、實際送入的 ID 數量，以及精確的皮克敏 ID 清單。這只用來比對 native 與遊戲 UI 的選隊差異；不會改變派遣策略或任何閘門。
 
-診斷列中的 `post-set-persisted` 與 `pre-start-settled` 會再以遊戲自身的 `get_Pikmins()` 唯讀確認目前保存的隊伍；它不是 UI hook，也不會變更遊戲的選擇。
-
 禮物盒會輸出候選並接受相同的 GPS 到點閘門，但只允許遊戲指定的皮克敏。若遊戲回報不可派遣，module 記錄略過且不會改派其他皮克敏。可派遣禮物盒尚未完成驗證；不要把它視為完成的功能。
 
 ### 控制檔
