@@ -177,6 +177,7 @@ void *available_restriction_method{};
 void *available_clock_instance_method{};
 void *available_clock_time_method{};
 void *selected_pikmins_method{};
+void *gift_allows_method{};
 RegisterMapObject original_register_map_object{};
 SimpleMethod original_map_update{};
 GetFlowerProto original_get_flower_proto{};
@@ -815,10 +816,12 @@ void *verified_v152_method(void *klass, const char *name, int args, uintptr_t ex
 // picker. Allows() only applies expedition restrictions, not busy status.
 // Use a concrete GetPikminList snapshot: no new generic enumerator calls.
 void *available_expedition_pikmins(void *task_key, const std::string &owner,
+                                 void *expedition_data, bool is_gift, const std::string &designated,
                                  std::set<std::string> &eligible_ids,
                                  std::map<std::string, int> &statuses,
                                  std::map<std::string, std::string> &assigned_tasks) {
     eligible_ids.clear();
+    if (is_gift && (!expedition_data || !gift_allows_method)) return nullptr;
     if (!return_inventory_manager || !available_list_method || !available_proto_method ||
         !available_status_method || !available_restriction_method || !available_clock_instance_method ||
         !available_clock_time_method || !available_pikmin_class || !available_proto_class ||
@@ -846,7 +849,7 @@ void *available_expedition_pikmins(void *task_key, const std::string &owner,
     auto restrict_actions = reinterpret_cast<RestrictPikminActions>(*reinterpret_cast<void **>(available_restriction_method));
     auto **items = reinterpret_cast<void **>(static_cast<uint8_t *>(storage) + 0x20);
     std::vector<void *> eligible;
-    int busy{}, restricted{}, reserved{};
+    int busy{}, restricted{}, reserved{}, gift_filtered{};
     for (int index = 0; index < count; ++index) {
         void *pikmin = items[index];
         if (!pikmin || object_get_class(pikmin) != available_pikmin_class) return nullptr;
@@ -867,6 +870,15 @@ void *available_expedition_pikmins(void *task_key, const std::string &owner,
         if (!pikmin::dispatch_status_available(status)) { ++busy; continue; }
         if (restrict_actions(proto, time_ms, task_key, available_restriction_method)) { ++restricted; continue; }
         if (!dispatch_reservations.permits(id, owner)) { ++reserved; continue; }
+        if (is_gift) {
+            // The fastest-team helper must receive an already eligible candidate set.
+            // Never let an unrelated idle Pikmin compete for a personal gift.
+            if (designated.empty() || id != designated) { ++gift_filtered; continue; }
+            using AllowsPikmin = bool (*)(void *, void *, void *);
+            auto allows = reinterpret_cast<AllowsPikmin>(*reinterpret_cast<void **>(gift_allows_method));
+            if (!pikmin::gift_candidate_allowed(designated, id,
+                    allows(expedition_data, pikmin, gift_allows_method))) { ++gift_filtered; continue; }
+        }
         eligible.push_back(pikmin);
         eligible_ids.insert(id);
     }
@@ -876,8 +888,8 @@ void *available_expedition_pikmins(void *task_key, const std::string &owner,
     if (!array_root.handle) return nullptr;
     auto **values = reinterpret_cast<void **>(static_cast<uint8_t *>(array) + 0x20);
     for (size_t index = 0; index < eligible.size(); ++index) gc_write_barrier(array, &values[index], eligible[index]);
-    LOGI("[DISPATCH-AVAILABLE] task=%s total=%d eligible=%zu busy=%d restricted=%d reserved=%d held=%zu",
-         utf8_string(task_key).c_str(), count, eligible.size(), busy, restricted, reserved, dispatch_reservations.size());
+    LOGI("[DISPATCH-AVAILABLE] task=%s total=%d eligible=%zu busy=%d restricted=%d reserved=%d held=%zu giftFiltered=%d",
+         utf8_string(task_key).c_str(), count, eligible.size(), busy, restricted, reserved, dispatch_reservations.size(), gift_filtered);
     return array;
 }
 
@@ -1117,6 +1129,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 ? get_expedition_can_try_start(data, nullptr) : false;
         if (game_duration <= 0 && id_text == observed_expedition_task_id) game_duration = observed_expedition_duration_ms;
         const bool is_gift = std::strcmp(kind, "gift") == 0;
+        const std::string designated = is_gift ? gift_designated_pikmin(expedition) : std::string{};
         void *utils = data ? *reinterpret_cast<void **>(static_cast<uint8_t *>(data) + 0x48) : nullptr;
         void *scope = data ? *reinterpret_cast<void **>(static_cast<uint8_t *>(data) + 0x98) : nullptr;
         if (utils && !expedition_utils_metadata_logged && object_get_class) {
@@ -1127,7 +1140,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         std::map<std::string, int> pikmin_statuses;
         std::map<std::string, std::string> pikmin_assigned_tasks;
         void *pikmins = available_expedition_pikmins(get_expedition_item_key && data
-                ? get_expedition_item_key(data, nullptr) : nullptr, id_text, eligible_ids,
+                ? get_expedition_item_key(data, nullptr) : nullptr, id_text, data, is_gift, designated, eligible_ids,
                 pikmin_statuses, pikmin_assigned_tasks);
         ScopedManagedRoot available_root(pikmins, gchandle_new, gchandle_free);
         void *picked = utils && pick_fastest_pikmins && pikmins && scope
@@ -1137,7 +1150,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         int picked_count = count_enumerable_items(picked);
         bool gift_pikmin_unavailable = is_gift && (!picked || picked_count <= 0);
         if (is_gift) {
-            const std::string owner = gift_designated_pikmin(expedition);
+            const std::string &owner = designated;
             std::string picker_ids;
             int picker_id_count{};
             void *gift_ids = picked_pikmin_ids_array(picked, &picker_ids, &picker_id_count);
@@ -1164,7 +1177,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
             LOGI("[GIFT-DIAG] task=%s player=%.7f,%.7f spawn=%.7f,%.7f finish=%.7f,%.7f duration=%" PRId64 " canStart=%d picked=%d",
                  id_text.c_str(), current_latitude, current_longitude, latitude, longitude,
                  finish_latitude, finish_longitude, game_duration, can_start ? 1 : 0, picked_count);
-            LOGI("[GIFT-DIAG] task=%s gamePickerCount=%d; eligibility delegated to ExpeditionItemData.Allows",
+            LOGI("[GIFT-DIAG] task=%s gamePickerCount=%d; designated owner and native Allows filtered before picker",
                  id_text.c_str(), picked_count);
         }
         // Armed mode may start a bounded group of nearby tasks from this one
@@ -1262,10 +1275,8 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         } else if ((armed_capacity_available || batch_capacity_available) && requested && data && picked &&
             picked_count > 0 && set_expedition_pikmins &&
             distance >= 0.0 && distance <= allowed_distance) {
-            // The picker calls ExpeditionItemData.Allows for every candidate.
-            // For ordinary gifts that enforces Restriction.AllowedPikminId;
-            // for rare-deco gifts it enforces AllowsRareDecoGift. Never
-            // substitute a controller-chosen Pikmin.
+            // Gifts reach the picker only after designated-ID and native
+            // Allows checks. Never substitute an unrelated idle Pikmin.
             std::string selected_ids;
             int selected_id_count{};
             void *ids = picked_pikmin_ids_array(picked, &selected_ids, &selected_id_count);
@@ -1871,6 +1882,7 @@ void install_return_diagnostic_hook() {
     available_clock_instance_method = verified_v152_method(availability_clock, "get_Instance", 0, 0x6CF3E18);
     available_clock_time_method = verified_v152_method(availability_clock, "get_CurrentTimeMs", 0, 0x6CF4184);
     selected_pikmins_method = verified_v152_method(expedition_item_class, "get_Pikmins", 0, 0x5FAFBF8);
+    gift_allows_method = verified_v152_method(expedition_item_class, "Allows", 1, 0x5FB1F10);
     void *utils_class = find_class("Niantic.Ichigo.Game.Expedition", "ExpeditionUtils");
     void *pick_fastest_method = utils_class ? class_get_method_from_name(utils_class,
             "PickFastestUpToItemLimitsReservingForTroop", 3) : nullptr;

@@ -8,6 +8,10 @@
 namespace pikmin {
 inline bool batch_duration_safe(int64_t ms) { return ms > 0 && ms <= 2000; }
 inline bool dispatch_status_available(int status) { return status == 1 || status == 32; }
+inline bool gift_candidate_allowed(const std::string &designated, const std::string &candidate,
+                                   bool native_allows) {
+    return !designated.empty() && candidate == designated && native_allows;
+}
 
 inline std::vector<std::string> dispatch_ids(const std::string &csv) {
     std::vector<std::string> ids;

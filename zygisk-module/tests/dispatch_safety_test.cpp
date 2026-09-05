@@ -7,6 +7,11 @@ int main() {
     assert(batch_duration_safe(1) && batch_duration_safe(2000));
     assert(dispatch_status_available(1) && dispatch_status_available(32));
     assert(!dispatch_status_available(2) && !dispatch_status_available(0) && !dispatch_status_available(999));
+    assert(gift_candidate_allowed("owner", "owner", true));
+    assert(!gift_candidate_allowed("owner", "other", true));
+    assert(!gift_candidate_allowed("", "", true));
+    assert(!gift_candidate_allowed("owner", "owner", false));
+    assert(!(dispatch_status_available(2) && gift_candidate_allowed("owner", "owner", true)));
     assert(dispatch_ids("a,b").size() == 2);
     for (auto value : {"", "a,", ",a", "a,a", "a,,b", "<empty>", "a\tb"}) assert(dispatch_ids(value).empty());
     assert(same_dispatch_team({"a", "b"}, {"b", "a"}));
