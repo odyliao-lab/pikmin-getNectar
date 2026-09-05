@@ -302,6 +302,7 @@ char return_status_path[512]{};
 char return_batch_limit_path[512]{};
 char compatibility_path[512]{};
 char dispatch_candidates_path[512]{};
+char dispatch_availability_path[512]{};
 char dispatch_status_path[512]{};
 char dispatch_mode_path[512]{};
 // Optional restriction for armed mode. Missing/unknown means all existing
@@ -999,6 +1000,8 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     if (!items || count < 0 || count > kMaxPikminTaskListCount) return;
     FILE *file = std::fopen(dispatch_candidates_path, "w");
     if (!file) return;
+    std::string availability_rows;
+    int availability_count{};
     double current_latitude{}, current_longitude{};
     const bool has_current_location = current_location(current_latitude, current_longitude);
     const std::string dispatch_mode = read_dispatch_mode();
@@ -1139,10 +1142,19 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         std::set<std::string> eligible_ids;
         std::map<std::string, int> pikmin_statuses;
         std::map<std::string, std::string> pikmin_assigned_tasks;
-        void *pikmins = available_expedition_pikmins(get_expedition_item_key && data
-                ? get_expedition_item_key(data, nullptr) : nullptr, id_text, data, is_gift, designated, eligible_ids,
+        void *task_key = get_expedition_item_key && data ? get_expedition_item_key(data, nullptr) : nullptr;
+        void *pikmins = available_expedition_pikmins(task_key, id_text, data, is_gift, designated, eligible_ids,
                 pikmin_statuses, pikmin_assigned_tasks);
         ScopedManagedRoot available_root(pikmins, gchandle_new, gchandle_free);
+        const char *preflight = pikmin::preflight_reason(pikmins && available_root.handle && task_key && data,
+                is_gift, id_text, designated, pikmin_statuses, pikmin_assigned_tasks, eligible_ids.size());
+        const auto owner_state = pikmin_statuses.find(designated);
+        const auto owner_assignment = pikmin_assigned_tasks.find(designated);
+        availability_rows += id_text + "\t" + kind + "\t" + preflight + "\t" + designated + "\t" +
+                (owner_assignment == pikmin_assigned_tasks.end() ? "" : owner_assignment->second) + "\t" +
+                std::to_string(owner_state == pikmin_statuses.end() ? -1 : owner_state->second) + "\t" +
+                std::to_string(eligible_ids.size()) + "\n";
+        ++availability_count;
         void *picked = utils && pick_fastest_pikmins && pikmins && scope
                 ? pick_fastest_pikmins(utils, data, pikmins, scope, nullptr) : nullptr;
         ScopedManagedRoot picked_root(picked, gchandle_new, gchandle_free);
@@ -1436,6 +1448,19 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     if (complete_task_projection) dispatch_reservations.reconcile_tasks(live_task_ids, observed_ms);
     std::fclose(file);
     chmod(dispatch_candidates_path, 0644);
+    // Separate versioned advisory file keeps the existing 12-column contract.
+    // Publish only complete files; readers reject stale/PID-mismatched data.
+    const std::string availability_tmp = std::string(dispatch_availability_path) + ".tmp";
+    FILE *availability = std::fopen(availability_tmp.c_str(), "w");
+    if (availability) {
+        if (!complete_task_projection) { availability_rows.clear(); availability_count = 0; }
+        std::fprintf(availability, "v1\t%lld\t%d\n%send\t%d\n", observed_ms,
+                static_cast<int>(getpid()), availability_rows.c_str(), availability_count);
+        const bool written = std::fflush(availability) == 0 && !std::ferror(availability) &&
+                fchmod(fileno(availability), 0644) == 0;
+        const bool closed = std::fclose(availability) == 0;
+        if (written && closed) std::rename(availability_tmp.c_str(), dispatch_availability_path);
+    }
     FILE *status = std::fopen(dispatch_status_path, "w");
     if (!status) return;
     std::fprintf(status, "%lld\t%s\t%d\t%s\n", observed_ms,
@@ -3254,6 +3279,7 @@ void start(const char *game_data_dir) {
     std::snprintf(return_batch_limit_path, sizeof(return_batch_limit_path), "/data/local/tmp/pikmin-return-batch-limit.txt");
     std::snprintf(compatibility_path, sizeof(compatibility_path), "%s/files/compatibility_status.tsv", game_data_dir);
     std::snprintf(dispatch_candidates_path, sizeof(dispatch_candidates_path), "%s/files/dispatch_candidates.tsv", game_data_dir);
+    std::snprintf(dispatch_availability_path, sizeof(dispatch_availability_path), "%s/files/dispatch_availability.tsv", game_data_dir);
     std::snprintf(dispatch_status_path, sizeof(dispatch_status_path), "%s/files/dispatch_probe_status.tsv", game_data_dir);
     std::snprintf(dispatch_mode_path, sizeof(dispatch_mode_path), "/data/local/tmp/pikmin-dispatch-mode.txt");
     std::snprintf(dispatch_kinds_path, sizeof(dispatch_kinds_path), "/data/local/tmp/pikmin-dispatch-kinds.txt");

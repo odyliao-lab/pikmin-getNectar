@@ -8,6 +8,24 @@
 namespace pikmin {
 inline bool batch_duration_safe(int64_t ms) { return ms > 0 && ms <= 2000; }
 inline bool dispatch_status_available(int status) { return status == 1 || status == 32; }
+// Advisory preflight only: never authorises Start and never infers busy from
+// distance, CanTryStart, picker count or an incomplete inventory projection.
+inline const char *preflight_reason(bool complete, bool gift, const std::string &task,
+                                   const std::string &owner, const std::map<std::string, int> &statuses,
+                                   const std::map<std::string, std::string> &assignments, size_t eligible) {
+    if (!complete || statuses.empty()) return "unknown";
+    if (gift) {
+        const auto s = statuses.find(owner);
+        const auto a = assignments.find(owner);
+        if (owner.empty() || s == statuses.end()) return "unknown";
+        if (s->second == 2 && a != assignments.end() && !a->second.empty() && a->second != task)
+            return "gift-owner-busy";
+        return "unknown";
+    }
+    for (const auto &entry : statuses)
+        if (!dispatch_status_available(entry.second) && entry.second != 2) return "unknown";
+    return eligible == 0 ? "no-available-team" : "not-blocked";
+}
 inline bool gift_candidate_allowed(const std::string &designated, const std::string &candidate,
                                    bool native_allows) {
     return !designated.empty() && candidate == designated && native_allows;

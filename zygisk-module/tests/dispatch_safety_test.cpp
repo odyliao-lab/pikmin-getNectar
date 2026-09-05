@@ -12,6 +12,15 @@ int main() {
     assert(!gift_candidate_allowed("", "", true));
     assert(!gift_candidate_allowed("owner", "owner", false));
     assert(!(dispatch_status_available(2) && gift_candidate_allowed("owner", "owner", true)));
+    assert(std::string(preflight_reason(true, true, "gift", "p", {{"p",2}}, {{"p","mushroom"}}, 0)) == "gift-owner-busy");
+    for (const auto &assignment : {"", "gift"})
+        assert(std::string(preflight_reason(true, true, "gift", "p", {{"p",2}}, {{"p",assignment}}, 0)) == "unknown");
+    assert(std::string(preflight_reason(false, true, "gift", "p", {{"p",2}}, {{"p","other"}}, 0)) == "unknown");
+    assert(std::string(preflight_reason(true, true, "gift", "p", {{"p",1}}, {}, 0)) == "unknown");
+    assert(std::string(preflight_reason(true, false, "fruit", "", {{"p",2}}, {}, 0)) == "no-available-team");
+    assert(std::string(preflight_reason(true, false, "seed", "", {{"p",1}}, {}, 1)) == "not-blocked");
+    assert(std::string(preflight_reason(true, false, "seed", "", {{"p",999}}, {}, 0)) == "unknown");
+    assert(std::string(preflight_reason(true, false, "seed", "", {}, {}, 0)) == "unknown");
     assert(dispatch_ids("a,b").size() == 2);
     for (auto value : {"", "a,", ",a", "a,a", "a,,b", "<empty>", "a\tb"}) assert(dispatch_ids(value).empty());
     assert(same_dispatch_team({"a", "b"}, {"b", "a"}));
