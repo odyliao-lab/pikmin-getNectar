@@ -3,6 +3,7 @@
 #include "xdl.h"
 #include "And64InlineHook.hpp"
 #include "managed_gc.h"
+#include "dispatch_safety.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -175,6 +176,7 @@ void *available_status_method{};
 void *available_restriction_method{};
 void *available_clock_instance_method{};
 void *available_clock_time_method{};
+void *selected_pikmins_method{};
 RegisterMapObject original_register_map_object{};
 SimpleMethod original_map_update{};
 GetFlowerProto original_get_flower_proto{};
@@ -345,6 +347,9 @@ std::string batch_selection_settling_id;
 std::string batch_selection_settling_kind;
 long long batch_selection_settling_started_ms{};
 int batch_selection_settling_picked_count{};
+std::vector<std::string> batch_selection_settling_team;
+pikmin::DispatchReservations dispatch_reservations;
+std::map<std::string, std::string> last_gift_availability;
 // Batch mode deliberately owns one confirmation lock: its Java controller
 // must not advance to the next GPS point until this exact task is settled.
 // Armed mode is different.  A moving GPS provider can leave nearby targets
@@ -761,7 +766,7 @@ int count_enumerable_items(void *enumerable) {
     // explicit interface implementation, so no public GetEnumerator appears
     // in the concrete class metadata. In that case the returned object itself
     // is already the IEnumerator.
-    void *enumerator = get_enumerator ? get_enumerator(enumerable, nullptr) : enumerable;
+    void *enumerator = get_enumerator ? get_enumerator(enumerable, get_enumerator_method) : enumerable;
     void *enumerator_class = enumerator && object_get_class ? object_get_class(enumerator) : nullptr;
     void *move_next_method = enumerator_class
             ? class_get_method_from_name(enumerator_class, "MoveNext", 0) : nullptr;
@@ -784,7 +789,7 @@ int count_enumerable_items(void *enumerable) {
         return 0;
     }
     int count{};
-    while (count < 100 && move_next(enumerator, nullptr)) ++count;
+    while (count < 100 && move_next(enumerator, move_next_method)) ++count;
     LOGI("[DISPATCH-OBSERVE] iterator counted object=%p enumerator=%p count=%d", enumerable, enumerator, count);
     return count;
 }
@@ -809,7 +814,11 @@ void *verified_v152_method(void *klass, const char *name, int args, uintptr_t ex
 // Match ExpeditionPikminSelectionTools.GetIsBusyReason before the fastest
 // picker. Allows() only applies expedition restrictions, not busy status.
 // Use a concrete GetPikminList snapshot: no new generic enumerator calls.
-void *available_expedition_pikmins(void *task_key) {
+void *available_expedition_pikmins(void *task_key, const std::string &owner,
+                                 std::set<std::string> &eligible_ids,
+                                 std::map<std::string, int> &statuses,
+                                 std::map<std::string, std::string> &assigned_tasks) {
+    eligible_ids.clear();
     if (!return_inventory_manager || !available_list_method || !available_proto_method ||
         !available_status_method || !available_restriction_method || !available_clock_instance_method ||
         !available_clock_time_method || !available_pikmin_class || !available_proto_class ||
@@ -837,17 +846,29 @@ void *available_expedition_pikmins(void *task_key) {
     auto restrict_actions = reinterpret_cast<RestrictPikminActions>(*reinterpret_cast<void **>(available_restriction_method));
     auto **items = reinterpret_cast<void **>(static_cast<uint8_t *>(storage) + 0x20);
     std::vector<void *> eligible;
-    int busy{}, restricted{};
+    int busy{}, restricted{}, reserved{};
     for (int index = 0; index < count; ++index) {
         void *pikmin = items[index];
         if (!pikmin || object_get_class(pikmin) != available_pikmin_class) return nullptr;
         void *proto = get_proto(pikmin, available_proto_method);
         if (!proto || object_get_class(proto) != available_proto_class) return nullptr;
         const int status = get_status(proto, available_status_method);
+        const std::string id = utf8_string(get_inventory_item_id ? get_inventory_item_id(pikmin, nullptr) : nullptr);
+        if (id.empty() || statuses.count(id)) return nullptr;
+        statuses[id] = status;
+        // This is the live projected inventory, not claimed as server state.
+        if (status == 2 && wire_field_matches(available_proto_class, "status_", 0xC8)) {
+            void *assigned = *reinterpret_cast<void **>(static_cast<uint8_t *>(proto) + 0xC8);
+            if (assigned && wire_field_matches(object_get_class(assigned), "taskId_", 0x18))
+                assigned_tasks[id] = utf8_string(*reinterpret_cast<void **>(static_cast<uint8_t *>(assigned) + 0x18));
+        }
+        dispatch_reservations.observe(id, status);
         // v152 PikminProto.StatusOneofCase: Available=1, Entourage=32.
-        if (status != 1 && status != 32) { ++busy; continue; }
+        if (!pikmin::dispatch_status_available(status)) { ++busy; continue; }
         if (restrict_actions(proto, time_ms, task_key, available_restriction_method)) { ++restricted; continue; }
+        if (!dispatch_reservations.permits(id, owner)) { ++reserved; continue; }
         eligible.push_back(pikmin);
+        eligible_ids.insert(id);
     }
     void *array = array_new(available_pikmin_class, eligible.size());
     if (!array) return nullptr;
@@ -855,8 +876,8 @@ void *available_expedition_pikmins(void *task_key) {
     if (!array_root.handle) return nullptr;
     auto **values = reinterpret_cast<void **>(static_cast<uint8_t *>(array) + 0x20);
     for (size_t index = 0; index < eligible.size(); ++index) gc_write_barrier(array, &values[index], eligible[index]);
-    LOGI("[DISPATCH-AVAILABLE] task=%s total=%d eligible=%zu busy=%d restricted=%d",
-         utf8_string(task_key).c_str(), count, eligible.size(), busy, restricted);
+    LOGI("[DISPATCH-AVAILABLE] task=%s total=%d eligible=%zu busy=%d restricted=%d reserved=%d held=%zu",
+         utf8_string(task_key).c_str(), count, eligible.size(), busy, restricted, reserved, dispatch_reservations.size());
     return array;
 }
 
@@ -873,19 +894,23 @@ void *picked_pikmin_ids_array(void *enumerable, std::string *selected_ids, int *
     void *current_method = ienumerator ? class_get_method_from_name(ienumerator, "get_Current", 0) : nullptr;
     void *get_impl = get_method ? object_get_virtual_method(enumerable, get_method) : nullptr;
     auto get_enumerator = get_impl ? reinterpret_cast<GetEnumerable>(*reinterpret_cast<void **>(get_impl)) : nullptr;
-    void *enumerator = get_enumerator ? get_enumerator(enumerable, nullptr) : nullptr;
+    void *enumerator = get_enumerator ? get_enumerator(enumerable, get_impl) : nullptr;
+    ScopedManagedRoot enumerator_root(enumerator, gchandle_new, gchandle_free);
     void *move_impl = enumerator && move_method ? object_get_virtual_method(enumerator, move_method) : nullptr;
     void *current_impl = enumerator && current_method ? object_get_virtual_method(enumerator, current_method) : nullptr;
     auto move_next = move_impl ? reinterpret_cast<EnumeratorMoveNext>(*reinterpret_cast<void **>(move_impl)) : nullptr;
     auto current = current_impl ? reinterpret_cast<EnumeratorCurrent>(*reinterpret_cast<void **>(current_impl)) : nullptr;
-    if (!enumerator || !move_next || !current || !string_class) {
+    if (!enumerator || !enumerator_root.handle || !move_next || !current || !string_class || !gc_write_barrier) {
         LOGI("[DISPATCH-OBSERVE] ids unresolved enumerable=%p enumerator=%p get=%p move=%p current=%p",
              enumerable, enumerator, get_impl, move_impl, current_impl);
         return nullptr;
     }
     std::vector<void *> ids;
-    while (ids.size() < 100 && move_next(enumerator, nullptr)) {
-        void *pikmin = current(enumerator, nullptr);
+    // Generic-shared v152 iterators require the resolved implementation's
+    // MethodInfo (rgctx). WhereEnumerableIterator<object>.MoveNext reads it
+    // at +0x20; passing null crashed the 1.4.10 selected-team recheck.
+    while (ids.size() < 100 && move_next(enumerator, move_impl)) {
+        void *pikmin = current(enumerator, current_impl);
         void *id = pikmin ? get_inventory_item_id(pikmin, nullptr) : nullptr;
         if (id) ids.push_back(id);
     }
@@ -897,14 +922,46 @@ void *picked_pikmin_ids_array(void *enumerable, std::string *selected_ids, int *
         ids_for_diagnostics.append(id_text.empty() ? "<empty>" : id_text);
     }
     void *array = array_new(string_class, ids.size());
+    if (pikmin::dispatch_ids(ids_for_diagnostics).size() != ids.size()) return nullptr;
     if (!array) return nullptr;
     auto **values = reinterpret_cast<void **>(static_cast<uint8_t *>(array) + 0x20);
-    for (size_t index = 0; index < ids.size(); ++index) values[index] = ids[index];
+    for (size_t index = 0; index < ids.size(); ++index) gc_write_barrier(array, &values[index], ids[index]);
     if (selected_ids) *selected_ids = ids_for_diagnostics;
     if (selected_count) *selected_count = static_cast<int>(ids.size());
     LOGI("[DISPATCH-OBSERVE] selected %zu Pikmin ids array=%p ids=%s", ids.size(), array,
          ids_for_diagnostics.c_str());
     return array;
+}
+
+bool team_is_eligible(const std::vector<std::string> &team, const std::set<std::string> &eligible) {
+    if (team.empty()) return false;
+    for (const auto &id : team) if (!eligible.count(id)) return false;
+    return true;
+}
+
+bool selected_team_matches(void *data, const std::vector<std::string> &expected) {
+    if (!data || !selected_pikmins_method || expected.empty()) return false;
+    auto getter = reinterpret_cast<GetEnumerable>(*reinterpret_cast<void **>(selected_pikmins_method));
+    void *selected = getter(data, selected_pikmins_method);
+    ScopedManagedRoot root(selected, gchandle_new, gchandle_free);
+    if (!root.handle) return false;
+    std::string actual;
+    int count{};
+    void *ids = picked_pikmin_ids_array(selected, &actual, &count);
+    return ids && count == static_cast<int>(expected.size()) &&
+            pikmin::same_dispatch_team(expected, pikmin::dispatch_ids(actual));
+}
+
+std::string gift_designated_pikmin(void *expedition) {
+    if (!expedition || !wire_field_matches(object_get_class(expedition), "restriction_", 0x58)) return {};
+    void *restriction = *reinterpret_cast<void **>(static_cast<uint8_t *>(expedition) + 0x58);
+    if (!restriction || !wire_field_matches(object_get_class(restriction), "condition_", 0x18) ||
+        !wire_field_matches(object_get_class(restriction), "conditionCase_", 0x20)) return {};
+    // v152 RestrictionProto.ConditionOneofCase.AllowedPikminId = 1.
+    if (*reinterpret_cast<int *>(static_cast<uint8_t *>(restriction) + 0x20) != 1) return {};
+    void *id = *reinterpret_cast<void **>(static_cast<uint8_t *>(restriction) + 0x18);
+    if (!id || !dispatch_string_class || object_get_class(id) != dispatch_string_class) return {};
+    return utf8_string(id);
 }
 
 void log_dispatch_enumerable_metadata(void *object, const char *label) {
@@ -952,6 +1009,8 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     const bool batch_ready = batch && !batch_target.empty() &&
             dispatch_target_is_ready(batch_target, observed_ms);
     if (!batch || batch_selection_settling_id != batch_target) {
+        dispatch_reservations.cancel(batch_selection_settling_id);
+        batch_selection_settling_team.clear();
         batch_selection_settling_id.clear();
         batch_selection_settling_kind.clear();
         batch_selection_settling_started_ms = 0;
@@ -977,10 +1036,13 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     // identical from the Java side (both show as a silent stretch ending
     // in game-refresh-timeout).
     bool batch_target_seen_raw{};
+    std::set<std::string> live_task_ids;
+    bool complete_task_projection = true;
     for (auto &entry : armed_dispatches) entry.second.seen_this_scan = false;
     for (int index = 0; index < count; ++index) {
         void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
         void *proto = task ? get_pikmin_task_proto(task, nullptr) : nullptr;
+        if (!task || !proto) complete_task_projection = false;
         void *expedition = proto ? get_task_expedition(proto, nullptr) : nullptr;
         const int target_case = expedition ? get_expedition_target_case(expedition, nullptr) : 0;
         const int64_t finish_ms = proto ? get_task_finish_time_ms(proto, nullptr) : 0;
@@ -1006,6 +1068,8 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         void *id = get_inventory_item_id ? get_inventory_item_id(task, nullptr) : nullptr;
         const std::string id_text = utf8_string(id);
         if (batch && !batch_target.empty() && id_text == batch_target) batch_target_seen_raw = true;
+        if (!id_text.empty()) live_task_ids.insert(id_text);
+        else complete_task_projection = false;
         if (confirmation_due && id_text == dispatch_confirmation_pending_id)
             pending_confirmation_seen = true;
         auto armed_inflight = armed_dispatches.find(id_text);
@@ -1059,14 +1123,39 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
             expedition_utils_metadata_logged = true;
             log_class_methods("ExpeditionUtilsInstance", object_get_class(utils));
         }
+        std::set<std::string> eligible_ids;
+        std::map<std::string, int> pikmin_statuses;
+        std::map<std::string, std::string> pikmin_assigned_tasks;
         void *pikmins = available_expedition_pikmins(get_expedition_item_key && data
-                ? get_expedition_item_key(data, nullptr) : nullptr);
+                ? get_expedition_item_key(data, nullptr) : nullptr, id_text, eligible_ids,
+                pikmin_statuses, pikmin_assigned_tasks);
         ScopedManagedRoot available_root(pikmins, gchandle_new, gchandle_free);
         void *picked = utils && pick_fastest_pikmins && pikmins && scope
                 ? pick_fastest_pikmins(utils, data, pikmins, scope, nullptr) : nullptr;
+        ScopedManagedRoot picked_root(picked, gchandle_new, gchandle_free);
         log_dispatch_enumerable_metadata(picked ? picked : pikmins, picked ? "picked" : "pikminCollection");
         int picked_count = count_enumerable_items(picked);
         bool gift_pikmin_unavailable = is_gift && (!picked || picked_count <= 0);
+        if (is_gift) {
+            const std::string owner = gift_designated_pikmin(expedition);
+            std::string picker_ids;
+            int picker_id_count{};
+            void *gift_ids = picked_pikmin_ids_array(picked, &picker_ids, &picker_id_count);
+            const bool identity_matches = gift_ids && !owner.empty() && picker_id_count == 1 && picker_ids == owner;
+            const bool owner_eligible = pikmins && eligible_ids.count(owner);
+            gift_pikmin_unavailable = !identity_matches || !owner_eligible;
+            const int owner_status = pikmin_statuses.count(owner) ? pikmin_statuses.at(owner) : -1;
+            const std::string evidence = "owner=" + owner + ";projectedStatus=" + std::to_string(owner_status) +
+                    ";assignedTask=" + pikmin_assigned_tasks[owner] + ";picker=" + picker_ids +
+                    ";identity=" + (identity_matches ? "match" : "unknown-or-mismatch") +
+                    ";eligible=" + (owner_eligible ? "1" : "0");
+            if (last_gift_availability[id_text] != evidence) {
+                append_dispatch_selection_diagnostics(kind, id_text, "gift-owner-readonly", picked_count,
+                        picker_id_count, game_duration, false, false, evidence);
+                last_gift_availability[id_text] = evidence;
+            }
+            if (gift_pikmin_unavailable) { picked = nullptr; picked_count = 0; can_start = false; }
+        }
         if (batch_ready && id_text == batch_target && is_gift) {
             if (gift_target && !gift_target_metadata_logged && object_get_class) {
                 gift_target_metadata_logged = true;
@@ -1080,7 +1169,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         }
         // Armed mode may start a bounded group of nearby tasks from this one
         // live scan. Batch mode is stricter: the Control Center must name this
-        // exact task and prove a fresh five-second arrival gate before any game
+        // exact task and prove a fresh arrival gate before any game
         // API is invoked. The native side rechecks the live game location.
         const bool armed_kind_allowed = armed_kind_filter == "all" || armed_kind_filter == kind ||
                 (armed_kind_filter == "farm" && (std::strcmp(kind, "fruit") == 0 || std::strcmp(kind, "seed") == 0));
@@ -1100,6 +1189,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         // instead of an indirect time estimate.
         const double allowed_distance = batch ? 4.0 : 200.0;
         const bool armed_capacity_available = armed &&
+                !dispatch_reservations.has_sent(id_text) &&
                 armed_dispatches.size() < kArmedMaxInFlight &&
                 starts_requested < static_cast<int>(kArmedMaxStartsPerScan) &&
                 armed_inflight == armed_dispatches.end();
@@ -1110,7 +1200,15 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 observed_ms - batch_selection_settling_started_ms >= kBatchSelectionSettleMs) {
                 const bool carrying_power_settled = get_expedition_has_enough_carrying_power
                         ? get_expedition_has_enough_carrying_power(data, nullptr) : true;
+                const bool same_team_available = pikmins && team_is_eligible(batch_selection_settling_team, eligible_ids) &&
+                        selected_team_matches(data, batch_selection_settling_team);
+                // Read the actual selected team's fresh native duration. No
+                // observer fallback and no use of this tick's proposed picker.
+                const int64_t live_duration = data && original_get_expedition_total_duration_ms
+                        ? original_get_expedition_total_duration_ms(data, nullptr) : 0;
+                game_duration = live_duration;
                 const bool settled_gate = requested && data && can_start && carrying_power_settled &&
+                        same_team_available && !gift_pikmin_unavailable && pikmin::batch_duration_safe(live_duration) &&
                         start_expedition && distance >= 0.0 && distance <= allowed_distance;
                 if (settled_gate) {
                     append_dispatch_selection_diagnostics(kind, id_text, "pre-start-settled",
@@ -1121,6 +1219,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                     pending_expedition_ms_since_previous_attempt = last_expedition_attempt_started_ms > 0
                             ? attempt_now - last_expedition_attempt_started_ms : -1;
                     last_expedition_attempt_started_ms = attempt_now;
+                    dispatch_reservations.sent(id_text, attempt_now);
                     module_start_call = true;
                     void *start_result = start_expedition(data, nullptr);
                     module_start_call = false;
@@ -1147,11 +1246,14 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                          game_duration, batch_selection_settling_picked_count, start_result,
                          can_start_after ? 1 : 0, finish_after);
                 } else {
-                    append_dispatch_history("selection-settle-blocked", kind, id_text,
+                    append_dispatch_history(!same_team_available ? "selected-team-unavailable" :
+                                            (!pikmin::batch_duration_safe(live_duration) ? "batch-duration-blocked" : "selection-settle-blocked"), kind, id_text,
                                             game_duration, batch_selection_settling_picked_count);
                     LOGI("[DISPATCH] settled start blocked task=%s canStart=%d carrying=%d distance=%.2f",
                          id_text.c_str(), can_start ? 1 : 0, carrying_power_settled ? 1 : 0, distance);
                 }
+                dispatch_reservations.cancel(batch_selection_settling_id);
+                batch_selection_settling_team.clear();
                 batch_selection_settling_id.clear();
                 batch_selection_settling_kind.clear();
                 batch_selection_settling_started_ms = 0;
@@ -1167,7 +1269,10 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
             std::string selected_ids;
             int selected_id_count{};
             void *ids = picked_pikmin_ids_array(picked, &selected_ids, &selected_id_count);
-            if (ids) {
+            ScopedManagedRoot ids_root(ids, gchandle_new, gchandle_free);
+            const auto selected_team = pikmin::dispatch_ids(selected_ids);
+            if (ids && ids_root.handle && selected_id_count == picked_count &&
+                team_is_eligible(selected_team, eligible_ids) && dispatch_reservations.reserve(id_text, selected_team)) {
                 set_expedition_pikmins(data, ids, nullptr);
                 game_duration = original_get_expedition_total_duration_ms
                         ? original_get_expedition_total_duration_ms(data, nullptr) : game_duration;
@@ -1181,12 +1286,10 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 ++selections_applied;
                 LOGI("[DISPATCH-OBSERVE] armed selection task=%s duration=%" PRId64 " canStart=%d picked=%d carryingPower=%d",
                      id_text.c_str(), game_duration, can_start ? 1 : 0, picked_count, carrying_power_after ? 1 : 0);
-                // distance is already <= allowed_distance here (checked above),
-                // so the radius gate for this dispatch is the distance check,
-                // not the game's derived duration -- can_start is the only
-                // remaining game-side condition.
+                // Armed keeps its 200m radius. Batch additionally checks the
+                // actual team's <=2s native duration on the later start tick.
                 gift_pikmin_unavailable = is_gift && !can_start;
-                if (can_start && start_expedition) {
+                if (can_start && carrying_power_after && start_expedition && selected_team_matches(data, selected_team)) {
                     if (batch) {
                         // Do not call StartExpeditionAsync in the same update
                         // turn as SetPikmins. The next live inventory tick
@@ -1195,6 +1298,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                         batch_selection_settling_kind = kind;
                         batch_selection_settling_started_ms = observed_ms;
                         batch_selection_settling_picked_count = picked_count;
+                        batch_selection_settling_team = selected_team;
                         append_dispatch_history("selection-settling", kind, id_text,
                                                 game_duration, picked_count);
                         LOGI("[DISPATCH] selection settling task=%s waitMs=%lld picked=%d",
@@ -1208,6 +1312,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                     pending_expedition_ms_since_previous_attempt = last_expedition_attempt_started_ms > 0
                             ? attempt_now - last_expedition_attempt_started_ms : -1;
                     last_expedition_attempt_started_ms = attempt_now;
+                    dispatch_reservations.sent(id_text, attempt_now);
                     module_start_call = true;
                     void *start_result = start_expedition(data, nullptr);
                     module_start_call = false;
@@ -1251,6 +1356,9 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                                             game_duration, picked_count);
                     dispatch_last_gift_skip_id = id_text;
                 }
+                if (!batch || batch_selection_settling_id != id_text) dispatch_reservations.cancel(id_text);
+            } else {
+                append_dispatch_history("selected-team-unavailable", kind, id_text, game_duration, picked_count);
             }
         } else if (batch_ready && id_text == batch_target) {
             // The batch's own named target failed the dispatch gate this
@@ -1314,6 +1422,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
             ++it;
         }
     }
+    if (complete_task_projection) dispatch_reservations.reconcile_tasks(live_task_ids, observed_ms);
     std::fclose(file);
     chmod(dispatch_candidates_path, 0644);
     FILE *status = std::fopen(dispatch_status_path, "w");
@@ -1761,6 +1870,7 @@ void install_return_diagnostic_hook() {
             "ShouldRestrictActionsUnlessIsTask", 3, 0x6D456FC);
     available_clock_instance_method = verified_v152_method(availability_clock, "get_Instance", 0, 0x6CF3E18);
     available_clock_time_method = verified_v152_method(availability_clock, "get_CurrentTimeMs", 0, 0x6CF4184);
+    selected_pikmins_method = verified_v152_method(expedition_item_class, "get_Pikmins", 0, 0x5FAFBF8);
     void *utils_class = find_class("Niantic.Ichigo.Game.Expedition", "ExpeditionUtils");
     void *pick_fastest_method = utils_class ? class_get_method_from_name(utils_class,
             "PickFastestUpToItemLimitsReservingForTroop", 3) : nullptr;
