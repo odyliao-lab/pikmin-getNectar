@@ -58,7 +58,9 @@ native **1.4.9 / code 43** 在最快選隊前加入狀態與動作限制篩選�
 
 1.4.10 的已送出隊伍預留不因 `off` 或 RPC 逾時直接釋放，以免模式切換後重新使用仍可能在途的皮克敏；需等待庫存狀態轉換或任務消失的證據。
 
-## 花田種花控制（第一階段）
+## 花田種花控制
+
+native1.4.12 + Control Center0.6.5 已於 Android14 完成新鮮花田14點×2輪：17筆水果全部原生派遣並領取、無RPC失敗或遊戲閃退，全程連續種花及停止後原生關閉結算視窗流程正常。這不是同路線速度比較，也不代表所有可能花朵皆產果。[實測與限制](FLOWER_FARM_2026-09-05.md)。
 
 原生 module 另讀取 `/data/local/tmp/pikmin-planting-mode.txt`：`on` 會使用遊戲目前選取的花瓣，呼叫遊戲自身的 `StartPlantingWithConfirmationAsync(..., false)`；`off` 只會停止由 module 自己啟動的種花，絕不停止玩家原本手動開始的 session。缺少或未知值一律只是觀察，不會改變種花狀態。狀態寫到 `files/planting_control_status.tsv`。
 
