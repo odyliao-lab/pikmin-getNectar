@@ -2,6 +2,7 @@
 #include "log.h"
 #include "xdl.h"
 #include "And64InlineHook.hpp"
+#include "managed_gc.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -69,12 +70,20 @@ using AssemblyGetImage = void *(*)(const void *);
 using ClassFromName = void *(*)(void *, const char *, const char *);
 using ClassGetMethodFromName = void *(*)(void *, const char *, int);
 using ClassGetMethods = void *(*)(void *, void **);
+using ClassGetField = void *(*)(void *, const char *);
+using FieldGetOffset = size_t (*)(void *);
+using SendExpeditionRpc = void *(*)(void *, void *, void *, int, void *);
 using MethodGetName = const char *(*)(void *);
 using MethodGetParamCount = uint32_t (*)(void *);
 using ObjectNew = void *(*)(void *);
 using ArrayNew = void *(*)(void *, size_t);
 using StringNew = void *(*)(const char *);
-using GcHandleNew = uint32_t (*)(void *, bool);
+using pikmin::GcHandle;
+using pikmin::GcHandleNew;
+using pikmin::GcHandleFree;
+using pikmin::ScopedManagedRoot;
+using GcWriteBarrier = void (*)(void *, void **, void *);
+using RestrictPikminActions = bool (*)(void *, int64_t, void *, void *);
 using TaskBool = bool (*)(void *, void *);
 using RegisterMapObject = void (*)(void *, void *, int, void *);
 using SimpleMethod = void (*)(void *, void *);
@@ -142,12 +151,30 @@ AssemblyGetImage assembly_get_image{};
 ClassFromName class_from_name{};
 ClassGetMethodFromName class_get_method_from_name{};
 ClassGetMethods class_get_methods{};
+ClassGetField class_get_field{};
+FieldGetOffset field_get_offset{};
+SendExpeditionRpc original_send_expedition_rpc{};
+void *dispatch_request_class{};
+void *dispatch_point_class{};
+void *dispatch_string_class{};
+char dispatch_wire_path[512]{};
+thread_local bool module_start_call{};
 MethodGetName method_get_name{};
 MethodGetParamCount method_get_param_count{};
 ObjectNew object_new{};
 ArrayNew array_new{};
 StringNew string_new{};
 GcHandleNew gchandle_new{};
+GcHandleFree gchandle_free{};
+GcWriteBarrier gc_write_barrier{};
+void *available_pikmin_class{};
+void *available_proto_class{};
+void *available_list_method{};
+void *available_proto_method{};
+void *available_status_method{};
+void *available_restriction_method{};
+void *available_clock_instance_method{};
+void *available_clock_time_method{};
 RegisterMapObject original_register_map_object{};
 SimpleMethod original_map_update{};
 GetFlowerProto original_get_flower_proto{};
@@ -328,7 +355,7 @@ constexpr size_t kArmedMaxInFlight = 3;
 constexpr size_t kArmedMaxStartsPerScan = 3;
 struct ArmedDispatchInFlight {
     void *task{};
-    uint32_t task_handle{};
+    GcHandle task_handle{};
     std::string kind;
     long long started_ms{};
     long long ms_since_previous_attempt{-1};
@@ -339,7 +366,7 @@ std::map<std::string, ArmedDispatchInFlight> armed_dispatches;
 // Batch mode still has only one Task to watch.  This is deliberately not
 // shared with armed_dispatches so batch cannot accidentally parallelise.
 void *pending_expedition_task{};
-uint32_t pending_expedition_task_handle{};
+GcHandle pending_expedition_task_handle{};
 std::string pending_expedition_task_id;
 std::string pending_expedition_task_kind;
 long long pending_expedition_task_started_ms{};
@@ -394,7 +421,7 @@ bool planting_control_stop_attempted{};
 std::string planting_control_last_mode = "observe";
 std::string planting_control_last_action = "observe";
 void *planting_control_pending_task{};
-uint32_t planting_control_pending_task_handle{};
+GcHandle planting_control_pending_task_handle{};
 void *planting_result_dialog{};
 long long planting_result_dialog_seen_ms{};
 long long planting_result_stop_requested_ms{};
@@ -412,7 +439,7 @@ bool speed_warning_hook_installed{};
 bool expedition_item_metadata_logged{};
 bool expedition_utils_metadata_logged{};
 void *pending_task{};
-uint32_t pending_task_handle{};
+GcHandle pending_task_handle{};
 std::string pending_id;
 double pending_gps_lat{};
 double pending_gps_lng{};
@@ -765,6 +792,74 @@ int count_enumerable_items(void *enumerable) {
 // The game's SetPikmins API accepts IEnumerable<string>.  A managed string[]
 // implements that interface, so it avoids fabricating a generic List<T> and
 // keeps the hand-off entirely inside the game's managed runtime.
+bool wire_field_matches(void *klass, const char *name, size_t expected);
+
+void *verified_v152_method(void *klass, const char *name, int args, uintptr_t expected_rva) {
+    void *method = klass ? class_get_method_from_name(klass, name, args) : nullptr;
+    void *entry = method ? *reinterpret_cast<void **>(method) : nullptr;
+    Dl_info info{};
+    if (!entry || !dladdr(entry, &info) ||
+        reinterpret_cast<uintptr_t>(entry) - reinterpret_cast<uintptr_t>(info.dli_fbase) != expected_rva) {
+        LOGE("[DISPATCH-AVAILABLE] method mismatch %s; availability fails closed", name);
+        return nullptr;
+    }
+    return method;
+}
+
+// Match ExpeditionPikminSelectionTools.GetIsBusyReason before the fastest
+// picker. Allows() only applies expedition restrictions, not busy status.
+// Use a concrete GetPikminList snapshot: no new generic enumerator calls.
+void *available_expedition_pikmins(void *task_key) {
+    if (!return_inventory_manager || !available_list_method || !available_proto_method ||
+        !available_status_method || !available_restriction_method || !available_clock_instance_method ||
+        !available_clock_time_method || !available_pikmin_class || !available_proto_class ||
+        !gchandle_new || !gchandle_free || !gc_write_barrier || !array_new) return nullptr;
+    auto get_list = reinterpret_cast<GetEnumerable>(*reinterpret_cast<void **>(available_list_method));
+    void *list = get_list(return_inventory_manager, available_list_method);
+    ScopedManagedRoot list_root(list, gchandle_new, gchandle_free);
+    if (!list || !list_root.handle) return nullptr;
+    void *klass = object_get_class(list);
+    if (!wire_field_matches(klass, "_items", 0x10) || !wire_field_matches(klass, "_size", 0x18)) return nullptr;
+    auto *bytes = static_cast<uint8_t *>(list);
+    void *storage = *reinterpret_cast<void **>(bytes + 0x10);
+    const int count = *reinterpret_cast<int *>(bytes + 0x18);
+    if (!storage || count < 0 || count > 10000) return nullptr;
+    const size_t capacity = *reinterpret_cast<size_t *>(static_cast<uint8_t *>(storage) + 0x18);
+    if (capacity < static_cast<size_t>(count) || capacity > 16384) return nullptr;
+    auto get_clock = reinterpret_cast<StaticNoArgTask>(*reinterpret_cast<void **>(available_clock_instance_method));
+    void *clock = get_clock(available_clock_instance_method);
+    if (!clock) return nullptr;
+    auto get_time = reinterpret_cast<GetTaskLong>(*reinterpret_cast<void **>(available_clock_time_method));
+    const int64_t time_ms = get_time(clock, available_clock_time_method);
+    if (time_ms <= 0) return nullptr;
+    auto get_proto = reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(available_proto_method));
+    auto get_status = reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(available_status_method));
+    auto restrict_actions = reinterpret_cast<RestrictPikminActions>(*reinterpret_cast<void **>(available_restriction_method));
+    auto **items = reinterpret_cast<void **>(static_cast<uint8_t *>(storage) + 0x20);
+    std::vector<void *> eligible;
+    int busy{}, restricted{};
+    for (int index = 0; index < count; ++index) {
+        void *pikmin = items[index];
+        if (!pikmin || object_get_class(pikmin) != available_pikmin_class) return nullptr;
+        void *proto = get_proto(pikmin, available_proto_method);
+        if (!proto || object_get_class(proto) != available_proto_class) return nullptr;
+        const int status = get_status(proto, available_status_method);
+        // v152 PikminProto.StatusOneofCase: Available=1, Entourage=32.
+        if (status != 1 && status != 32) { ++busy; continue; }
+        if (restrict_actions(proto, time_ms, task_key, available_restriction_method)) { ++restricted; continue; }
+        eligible.push_back(pikmin);
+    }
+    void *array = array_new(available_pikmin_class, eligible.size());
+    if (!array) return nullptr;
+    ScopedManagedRoot array_root(array, gchandle_new, gchandle_free);
+    if (!array_root.handle) return nullptr;
+    auto **values = reinterpret_cast<void **>(static_cast<uint8_t *>(array) + 0x20);
+    for (size_t index = 0; index < eligible.size(); ++index) gc_write_barrier(array, &values[index], eligible[index]);
+    LOGI("[DISPATCH-AVAILABLE] task=%s total=%d eligible=%zu busy=%d restricted=%d",
+         utf8_string(task_key).c_str(), count, eligible.size(), busy, restricted);
+    return array;
+}
+
 void *picked_pikmin_ids_array(void *enumerable, std::string *selected_ids, int *selected_count) {
     if (selected_ids) selected_ids->clear();
     if (selected_count) *selected_count = 0;
@@ -964,8 +1059,9 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
             expedition_utils_metadata_logged = true;
             log_class_methods("ExpeditionUtilsInstance", object_get_class(utils));
         }
-        void *pikmins = return_inventory_manager && get_pikmin_item_collection
-                ? get_pikmin_item_collection(return_inventory_manager, nullptr) : nullptr;
+        void *pikmins = available_expedition_pikmins(get_expedition_item_key && data
+                ? get_expedition_item_key(data, nullptr) : nullptr);
+        ScopedManagedRoot available_root(pikmins, gchandle_new, gchandle_free);
         void *picked = utils && pick_fastest_pikmins && pikmins && scope
                 ? pick_fastest_pikmins(utils, data, pikmins, scope, nullptr) : nullptr;
         log_dispatch_enumerable_metadata(picked ? picked : pikmins, picked ? "picked" : "pikminCollection");
@@ -1025,7 +1121,9 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                     pending_expedition_ms_since_previous_attempt = last_expedition_attempt_started_ms > 0
                             ? attempt_now - last_expedition_attempt_started_ms : -1;
                     last_expedition_attempt_started_ms = attempt_now;
+                    module_start_call = true;
                     void *start_result = start_expedition(data, nullptr);
+                    module_start_call = false;
                     const bool can_start_after = get_expedition_can_try_start
                             ? get_expedition_can_try_start(data, nullptr) : false;
                     const int64_t finish_after = get_task_finish_time_ms
@@ -1110,7 +1208,9 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                     pending_expedition_ms_since_previous_attempt = last_expedition_attempt_started_ms > 0
                             ? attempt_now - last_expedition_attempt_started_ms : -1;
                     last_expedition_attempt_started_ms = attempt_now;
+                    module_start_call = true;
                     void *start_result = start_expedition(data, nullptr);
+                    module_start_call = false;
                     const bool can_start_after = get_expedition_can_try_start
                             ? get_expedition_can_try_start(data, nullptr) : false;
                     const int64_t finish_after = get_task_finish_time_ms
@@ -1650,6 +1750,17 @@ void install_return_diagnostic_hook() {
             ? class_get_method_from_name(inventory, "get_PikminItemCollection", 0) : nullptr;
     get_pikmin_item_collection = pikmin_collection_method
             ? reinterpret_cast<GetEnumerable>(*reinterpret_cast<void **>(pikmin_collection_method)) : nullptr;
+    available_pikmin_class = find_class("Niantic.Ichigo.Inventory", "PikminInventoryItem");
+    available_proto_class = find_class("Ichigo.Proto", "PikminProto");
+    void *availability_extensions = find_class("Niantic.Ichigo.Utils.Proto", "PikminProtoExtensions");
+    void *availability_clock = find_class("Niantic.Ichigo.Utils", "ServerClock");
+    available_list_method = verified_v152_method(inventory, "GetPikminList", 0, 0x7297664);
+    available_proto_method = verified_v152_method(available_pikmin_class, "get_Proto", 0, 0x7280450);
+    available_status_method = verified_v152_method(available_proto_class, "get_StatusCase", 0, 0x5A252A8);
+    available_restriction_method = verified_v152_method(availability_extensions,
+            "ShouldRestrictActionsUnlessIsTask", 3, 0x6D456FC);
+    available_clock_instance_method = verified_v152_method(availability_clock, "get_Instance", 0, 0x6CF3E18);
+    available_clock_time_method = verified_v152_method(availability_clock, "get_CurrentTimeMs", 0, 0x6CF4184);
     void *utils_class = find_class("Niantic.Ichigo.Game.Expedition", "ExpeditionUtils");
     void *pick_fastest_method = utils_class ? class_get_method_from_name(utils_class,
             "PickFastestUpToItemLimitsReservingForTroop", 3) : nullptr;
@@ -1769,6 +1880,97 @@ void install_return_diagnostic_hook() {
     LOGI("[RETURN-DIAG] task-list hook installed method=%p entry=%p", list_method, list_entry);
 }
 
+// Observe existing protobuf storage only. Never enumerate managed objects or
+// invoke generated generic methods from this diagnostic hook.
+bool wire_field_matches(void *klass, const char *name, size_t expected) {
+    void *field = klass && class_get_field ? class_get_field(klass, name) : nullptr;
+    return field && field_get_offset && field_get_offset(field) == expected;
+}
+
+void *hooked_send_expedition_rpc(void *self, void *request, void *cancel_token,
+                               int retry_policy, void *method_info) {
+    if (request && object_get_class(request) == dispatch_request_class) {
+        auto *bytes = static_cast<uint8_t *>(request);
+        void *id = *reinterpret_cast<void **>(bytes + 0x18);
+        void *team = *reinterpret_cast<void **>(bytes + 0x20);
+        void *point = *reinterpret_cast<void **>(bytes + 0x28);
+        const std::string task_id = id && object_get_class(id) == dispatch_string_class ? utf8_string(id) : "invalid";
+        double latitude = NAN, longitude = NAN;
+        if (point && object_get_class(point) == dispatch_point_class) {
+            latitude = *reinterpret_cast<double *>(static_cast<uint8_t *>(point) + 0x18);
+            longitude = *reinterpret_cast<double *>(static_cast<uint8_t *>(point) + 0x20);
+        }
+        int count = -1;
+        std::string ids;
+        void *team_class = team ? object_get_class(team) : nullptr;
+        if (wire_field_matches(team_class, "array", 0x10) && wire_field_matches(team_class, "count", 0x18)) {
+            count = *reinterpret_cast<int *>(static_cast<uint8_t *>(team) + 0x18);
+            void *array = *reinterpret_cast<void **>(static_cast<uint8_t *>(team) + 0x10);
+            const size_t capacity = array ? *reinterpret_cast<size_t *>(static_cast<uint8_t *>(array) + 0x18) : 0;
+            if (count >= 0 && count <= 100 && static_cast<size_t>(count) <= capacity && capacity <= 4096) {
+                for (int i = 0; i < count; ++i) {
+                    void *value = *reinterpret_cast<void **>(static_cast<uint8_t *>(array) + 0x20 + i * sizeof(void *));
+                    if (i) ids.push_back(',');
+                    ids += value && object_get_class(value) == dispatch_string_class ? utf8_string(value) : "invalid";
+                }
+            } else { count = -1; }
+        }
+        // Bounded diagnostic ring. No changes to the transmitted request.
+        const long long observed = now_ms();
+        std::vector<std::string> rows;
+        std::ifstream previous(dispatch_wire_path);
+        std::string row;
+        while (std::getline(previous, row)) {
+            if (std::strtoll(row.c_str(), nullptr, 10) >= observed - 24LL * 60 * 60 * 1000) rows.push_back(row);
+        }
+        previous.close();
+        FILE *file = std::fopen(dispatch_wire_path, "w");
+        if (file) {
+            const size_t first = rows.size() > 255 ? rows.size() - 255 : 0;
+            for (size_t i = first; i < rows.size(); ++i) std::fprintf(file, "%s\n", rows[i].c_str());
+            std::fprintf(file, "%lld\t%s\t%s\t%.7f\t%.7f\t%d\t%s\n", observed,
+                         module_start_call ? "module" : "game", task_id.c_str(), latitude, longitude, count, ids.c_str());
+            std::fclose(file);
+            chmod(dispatch_wire_path, 0644);
+        }
+        LOGI("[DISPATCH-WIRE] source=%s task=%s location=%.7f,%.7f count=%d",
+             module_start_call ? "module" : "game", task_id.c_str(), latitude, longitude, count);
+    }
+    return original_send_expedition_rpc(self, request, cancel_token, retry_policy, method_info);
+}
+
+void install_dispatch_wire_probe() {
+    if (!class_get_field || !field_get_offset) return;
+    void *klass = find_class("Niantic.Ichigo.Rpc", "RpcManager");
+    void *method = klass ? class_get_method_from_name(klass, "SendStartExpeditionRpcAsync", 3) : nullptr;
+    void *entry = method ? *reinterpret_cast<void **>(method) : nullptr;
+    Dl_info info{};
+    // Cross-check live metadata against the actual v152 APK, never reference/dump.cs.
+    const uint32_t prologue[]{0xa9bc67fe, 0xa9015ff8, 0xa90257f6, 0xa9034ff4, 0xb0040397};
+    if (!entry || !dladdr(entry, &info) ||
+        reinterpret_cast<uintptr_t>(entry) - reinterpret_cast<uintptr_t>(info.dli_fbase) != 0x7263270 ||
+        std::memcmp(entry, prologue, sizeof(prologue)) != 0) {
+        LOGE("[DISPATCH-WIRE] disabled: runtime RPC entry/prologue mismatch");
+        return;
+    }
+    dispatch_request_class = find_class("Ichigo.Proto", "StartExpeditionRequestProto");
+    dispatch_point_class = find_class("Ichigo.Proto", "PointProto");
+    dispatch_string_class = find_class("System", "String");
+    if (!dispatch_string_class ||
+        !wire_field_matches(dispatch_request_class, "expeditionTaskId_", 0x18) ||
+        !wire_field_matches(dispatch_request_class, "pikminId_", 0x20) ||
+        !wire_field_matches(dispatch_request_class, "currentLocation_", 0x28) ||
+        !wire_field_matches(dispatch_point_class, "latDegrees_", 0x18) ||
+        !wire_field_matches(dispatch_point_class, "lngDegrees_", 0x20)) {
+        LOGE("[DISPATCH-WIRE] disabled: runtime protobuf layout mismatch");
+        return;
+    }
+    A64HookFunction(entry, reinterpret_cast<void *>(hooked_send_expedition_rpc),
+                    reinterpret_cast<void **>(&original_send_expedition_rpc));
+    LOGI("[DISPATCH-WIRE] v152 runtime-verified hook installed entry=%p original=%p", entry,
+         reinterpret_cast<void *>(original_send_expedition_rpc));
+}
+
 // This must run from a post-login game callback.  On v152 the library is
 // mapped long before its domain is usable, and calling domain_get from the
 // detached Zygisk worker can crash inside libil2cpp itself.
@@ -1782,6 +1984,7 @@ void initialize_runtime_metadata() {
     game_domain = domain;
     runtime_metadata_ready = true;
     install_return_diagnostic_hook();
+    install_dispatch_wire_probe();
     LOGI("[NECTAR] post-login IL2CPP metadata installed");
 }
 
@@ -2894,12 +3097,16 @@ void start(const char *game_data_dir) {
     class_get_method_from_name = reinterpret_cast<ClassGetMethodFromName>(
             xdl_sym(handle, "il2cpp_class_get_method_from_name", nullptr));
     class_get_methods = reinterpret_cast<ClassGetMethods>(xdl_sym(handle, "il2cpp_class_get_methods", nullptr));
+    class_get_field = reinterpret_cast<ClassGetField>(xdl_sym(handle, "il2cpp_class_get_field_from_name", nullptr));
+    field_get_offset = reinterpret_cast<FieldGetOffset>(xdl_sym(handle, "il2cpp_field_get_offset", nullptr));
     method_get_name = reinterpret_cast<MethodGetName>(xdl_sym(handle, "il2cpp_method_get_name", nullptr));
     method_get_param_count = reinterpret_cast<MethodGetParamCount>(xdl_sym(handle, "il2cpp_method_get_param_count", nullptr));
     object_new = reinterpret_cast<ObjectNew>(xdl_sym(handle, "il2cpp_object_new", nullptr));
     array_new = reinterpret_cast<ArrayNew>(xdl_sym(handle, "il2cpp_array_new", nullptr));
     string_new = reinterpret_cast<StringNew>(xdl_sym(handle, "il2cpp_string_new", nullptr));
     gchandle_new = reinterpret_cast<GcHandleNew>(xdl_sym(handle, "il2cpp_gchandle_new", nullptr));
+    gchandle_free = reinterpret_cast<GcHandleFree>(xdl_sym(handle, "il2cpp_gchandle_free", nullptr));
+    gc_write_barrier = reinterpret_cast<GcWriteBarrier>(xdl_sym(handle, "il2cpp_gc_wbarrier_set_field", nullptr));
     object_get_class = reinterpret_cast<ObjectGetClass>(xdl_sym(handle, "il2cpp_object_get_class", nullptr));
     object_get_virtual_method = reinterpret_cast<ObjectGetVirtualMethod>(xdl_sym(handle, "il2cpp_object_get_virtual_method", nullptr));
     class_get_name = reinterpret_cast<ClassGetName>(xdl_sym(handle, "il2cpp_class_get_name", nullptr));
@@ -2936,6 +3143,7 @@ void start(const char *game_data_dir) {
     std::snprintf(dispatch_rpc_fault_path, sizeof(dispatch_rpc_fault_path), "%s/files/dispatch_rpc_faults.tsv", game_data_dir);
     std::snprintf(dispatch_gate_block_path, sizeof(dispatch_gate_block_path), "%s/files/dispatch_gate_blocks.tsv", game_data_dir);
     std::snprintf(dispatch_tick_trace_path, sizeof(dispatch_tick_trace_path), "%s/files/dispatch_tick_trace.tsv", game_data_dir);
+    std::snprintf(dispatch_wire_path, sizeof(dispatch_wire_path), "%s/files/dispatch_wire_v152.tsv", game_data_dir);
     std::snprintf(planting_control_mode_path, sizeof(planting_control_mode_path), "/data/local/tmp/pikmin-planting-mode.txt");
     std::snprintf(planting_control_status_path, sizeof(planting_control_status_path), "%s/files/planting_control_status.tsv", game_data_dir);
     std::snprintf(flower_farm_mode_path, sizeof(flower_farm_mode_path), "/data/local/tmp/pikmin-flower-farm-mode.txt");

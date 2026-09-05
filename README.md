@@ -13,7 +13,7 @@
 ## 相容性
 
 - Pikmin Bloom `152.0`
-- Android `arm64-v8a`（已測 Android 13 / SDK 33）
+- Android `arm64-v8a`（已測 Android 13；native 1.4.9 已完成 Android 14 小批次驗證）
 - Magisk 與 Zygisk
 
 module 會驗證 `libil2cpp.so` 檔案大小；不相符時不安裝 hooks。其他遊戲版本不得直接沿用此建置。
@@ -34,9 +34,13 @@ module 會驗證 `libil2cpp.so` 檔案大小；不相符時不安裝 hooks。其
 
 已在 v152 實機驗證花苗／水果：選擇最快隊伍、原生派遣和後續庫存確認皆成功。派遣歷史 TSV 保留最近 24 小時，事件包括候選、套用隊伍、送出派遣與庫存確認。
 
+native **1.4.9 / code 43** 在最快選隊前加入狀態與動作限制篩選，並修正 v152 GC handle 必須保留 64 位元的問題。搭配 Control Center 0.6.3，在 Android 14 完成連續三筆水果／花苗首次派遣與領取，無遊戲閃退。這是有界小批次驗證；診斷方法、回退版本與限制見 [2026-09-05 紀錄](DIAGNOSTIC_REGRESSION_2026-09-05.md)。
+
 若 `StartExpeditionAsync()` 回報 server fault，`files/dispatch_selection_diagnostics.tsv` 會保留最近 24 小時的診斷列：時間、任務種類與 ID、`SetPikmins` 後的遊戲狀態、picker 數量、實際送入的 ID 數量，以及精確的皮克敏 ID 清單。這只用來比對 native 與遊戲 UI 的選隊差異；不會改變派遣策略或任何閘門。
 
 禮物盒會輸出候選並接受相同的 GPS 到點閘門，但只允許遊戲指定的皮克敏。若遊戲回報不可派遣，module 記錄略過且不會改派其他皮克敏。可派遣禮物盒尚未完成驗證；不要把它視為完成的功能。
+
+**已知限制（2026-09-05）：** 使用者手動確認六個禮物盒各自的專屬皮克敏都在打蘑菇，不能中斷或換人代領，但候選仍各顯示選隊數 1。這個矛盾尚未解決，候選數不是可派遣證明；禮物盒驗證暫停。現行 start 路徑也沒有獨立的批次 2 秒硬性時間閘門，不能用本次實測時間很短取代該限制的實作。
 
 ### 控制檔
 
