@@ -1,6 +1,28 @@
 # 一般附近派遣：定位同步與 120 秒上限
 
-## 最新實機進度：1.4.21 已載入，靜止單筆與 off 跳點觀察通過
+## 最新實機進度：armed 遠距離追趕與 3 筆並行領取通過
+
+2026-09-06 使用者同意直接操作驗證，目標仍192.168.50.202:5555 / Android14 / game PID10976。native1.4.21/code55、SO hash符合、遊戲在前景、附近原先off/0644、種類fruit seed；return=all，planting=off，批次／花田服務皆未運作。未操作其他ADB裝置。
+
+本輪原始證據在手機root-only目錄`/data/local/tmp/pikmin-nearby-armed-jump-1788696777000`：baseline.txt、before-candidates.tsv、逐秒gate.tsv、started-ids.txt、dispatch-history.tsv、selection.tsv、return-history.tsv。未提交整份遊戲日誌或二進位。工作區tmp有本輪執行與唯讀稽核腳本，不影響產品程式。
+
+- 開啟普通armed後，以既有JoyStick TELEPORT介面從24.3568325,124.1660690飛往35.7042269,139.4021074（實際float座標35.7042274,139.4021149）。目的地5筆花苗，本輪達3筆Start即關閉新派遣。沒有使用CC批次模式或畫面手勢。
+- raw先到、processed經27.1936827,127.9750805 → 30.0305309,131.7840919 → 32.8673792,135.5931034追趕。`game-location-catching-up`及`location-settling`期間新增Start均0；1788696791082才ready，epoch49→60。3筆選隊全部晚於目的地ready，並各隔約5秒才跨tick重驗及Start。
+- 三筆Start時間1788696799473、1788696799481、1788696799488，相差僅15ms，均早於任何一筆領取完成；不是循序等待收回。post-set隊員ID去重為7個，沒有跨任務重複；pre-start CanTryStart=1、power=1、原生duration均正值≤120000。
+
+| 任務ID | 原生往返ms | 隊伍數 | 選隊至重驗ms | Start至領取確認ms |
+| --- | ---: | ---: | ---: | ---: |
+| EhZpOEtrT0pRcFJJbUNRZEdKV01OLVVR | 168 | 1 | 5036 | 3966 |
+| EhZXMHN5bkJtNlIxLWJvVkpUR1dZci1R | 26242 | 1 | 5037 | 34234 |
+| EhYxN05lb2o0NVFZaWxrVm81SGRhQ1Z3 | 28742 | 5 | 5039 | 36256 |
+
+- 三筆都有start-rpc-completed及同ID返程batch-confirmed。最後一筆1788696835744確認後才還原GPS，期間沒有提早離開目的地。最終位置已回起點附近，ready/epoch70，附近off/0644、種類未改、PID10976持續運作；另外2筆花苗未派，保留後續樣本。
+- 唯讀稽核已檢查：恰3筆Start、選隊和Start皆在目的地ready之後、duration與pre-start相同且在範圍內、跨tick≥1500ms、隊員數符合且7個ID無重複、每筆各一次返程確認、Start跨度≤1000ms。全部通過。
+- 本輪首個測試腳本用Android shell算`epochSeconds*1000`溢位，錯把舊歷史算入新測試，安全中止且off；沒有新增Start。已先還原GPS，再將baseline改為字串`date +%s000`並驗13位數才正式重測。失敗證據目錄尾碼1990315864不可混入有效樣本，也不是native錯誤。
+
+**結論：本次「遠距離分段期間不提前派遣、到點穩定＋跨tick重驗、最多3筆並行且隊伍不重複、成功自動領取」已在這組花苗樣本端到端通過。** 不擴大宣稱所有類型／所有GPS app已驗證：本輪未重測水果／禮物／忙碌owner，未實際製造>120秒原生候選（上限邊界仍由既有policy測試覆蓋），批次／花田完整回歸及先前UI待辦另列。没有新程式、APK或native build，無需重開。
+
+## 前一輪：1.4.21 已載入，靜止單筆與 off 跳點觀察通過
 
 - 第二次重開後，目標仍192.168.50.202:5555 / 24095PCADG / Android14；game PID10976。19:56:00 hooks正常載入、19:56:31 `runtime fields verified=1`，未重現前次120秒loader逾時。module1.4.21/code55與SO `b3d8ee978390c220e6cc5b068816206294646e53a4be77ea57fbb6ef19850807`一致。
 - 新guard同PID、連續多次ready / 3個fix / epoch11，raw與processed約24.3568325,124.1660690。CLOCK_BOOTTIME freshness修正實機通過。
@@ -9,7 +31,7 @@
 - 單筆已領取後，維持off，以現有JoyStick TELEPORT service介面（不是CC UI操作）從原位置飛往既有花苗座標35.7042269,139.4021074，再返回原位置；沒有啟動批次／花田，兩者服務皆未運作。浮點目的地實際為35.7042274,139.4021149。
 - 真實逐秒觀察：1788696161450 raw已到目的地，processed仍在原位，gate=game-location-catching-up；之後processed依序27.1936812,127.9750805 → 30.0305300,131.7840919 → 32.8673787,135.5931034；1788696170524才到目的地並location-settling，1788696173535才ready。epoch11→20，追趕約9秒，再穩定約3秒。
 - 返程也出現3個中繼位置；1788696187686開始catching-up，1788696197791進入settling，1788696200833才ready，epoch20→30。最終已恢復原GPS附近24.3568325,124.1660690，game PID10976未變、附近off/0644、沒有額外Start。
-- **剩餘：armed狀態跨遠距離追趕時的端到端不誤派、到點多筆並行／不重複隊員及完整收回；批次／花田回歸與先前UI待辦仍保留。** off觀察證明guard判斷正確，但不能替代armed負向測試。本輪沒有改程式或產物，不需為本輪文件更新再重開。
+- 前一輪待辦中的armed跨跳點與3筆花苗並行領取，已由本文上方最新實測完成；批次／花田回歸與先前UI待辦仍保留。off觀察本身不能替代armed負向測試。
 
 ## 先前部署紀錄（以下保留時間順序，最新以上方為準）
 
