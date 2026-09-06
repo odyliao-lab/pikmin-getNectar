@@ -12,6 +12,8 @@
 
 ## 相容性
 
+開發中1.4.14/code48補齊可直接領取的搬運水果（含散步拾取／蘑菇獎勵），沿用原生領取與控制檔。已建置並安裝至Android14測試機，但新版實際入庫驗證尚未完成；既有dist暫不替換。[條件、測試與接續](CARRY_CLAIM_2026-09-06.md)。
+
 - Pikmin Bloom `152.0`
 - Android `arm64-v8a`（已測 Android 13；native 1.4.9 已完成 Android 14 小批次驗證）
 - Magisk 與 Zygisk

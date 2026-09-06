@@ -1,0 +1,15 @@
+# native1.4.14/code48: carried-resource return extension (live acceptance pending)
+
+User requested automatic collection of walking pickups and mushroom rewards still visible in the garden. Batch/farm efficiency work is paused separately. Old all-mode logs showed task count26, preparerReady0, finishDue0 while fruits were visible; actual new snapshot evidence is still required to confirm each task's state.
+
+The legacy return path rejected FinishTimeMs==0. Extend only Carry(case1) with an explicit Resource, CompletionRequirement.NONE(1) and nonnegative finish<=now. Preserve the existing positive due-time path. UNKNOWN(0), CALL_PREPARE_ACTION(2), future time and non-Carry zero-time tasks do not qualify for the extension. Do not use ShouldPrepareCompletion as a general ready predicate: verified v152 code0x6D4BBB8 only handles requirement2 and time. No force-complete/debug request and no changes to active mushrooms, GPS, dispatch or planting.
+
+Reuse existing CompletePikminTaskAsync and current one/batch/all controls. No new hooks/RVAs or generic enumerators. Add metadata-resolved CompletionRequirement and Carry.ChallengeInfo getters; source labels are carry:fruit or carry:mushroom-fruit plus existing Resource/HoneyBall description. ChallengeInfo absence is labelled ordinary pickup, not proof of walking provenance.
+
+Confirmation now requires exact pending task absence from a complete validated task list, not unrelated total count reduction. Raw completion Result<T> is not newly decoded: a dispatched request is not proof of storage credit. Existing60s batch timeout remains. `files/return_candidates.tsv` is a read-only atomic current snapshot even in off/dry-run: v1/observedMs/PID; taskId,taskCase,requirement,finishMs,ready,description; end/count. Legacy candidates stay unchanged.
+
+Tests: arm64 return policy20 checks run on device; existing five-enumerator MethodInfo static guard PASS. CC return labels7 and confirmation15 tests PASS; native/APK builds PASS. NewZIP SHA256 `05c4f6f71df2620f755585739f45d0cb1d767e92fc10fef80f1e8899d028ed48`, SO `7d7d58a7446d0f7301c67a00b391b2db925df9fde58fdde1902f3f8ef05946ff`.
+
+Installed/rebooted only192.168.50.202:5555 (POCO24095PCADG/Android14/Pikmin152.0). Active module version/hash and CC0.6.9/code26 verified after boot, but phone still locked; background PID10293 is not gameplay acceptance. Return currentlydry-run0644, dispatchoff0644, farmoff. Before this test user had returnall/dispatcharmed, backed up under root-only `/data/local/tmp/pikmin-carry-20260906`; preserve this current baseline instead of older handoff settings. Prior1.4.13 ZIP and SO saved, never rollback1.4.10. Published dist remains prior version until live acceptance.
+
+Next: unlock/open garden, inspect fresh full return snapshot; then one explicit ready Carry, verify exact receipt/task disappearance plus real fruit/nectar update; bounded second-source regression; restore original settings only after verification. CC `HANDOFF_2026-09-06_CARRY_CLAIM.md` has full commands/backup paths and follow-up steps. Existing screenshots/XML remain untouched and unstaged.

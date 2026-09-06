@@ -4,6 +4,7 @@
 #include "And64InlineHook.hpp"
 #include "managed_gc.h"
 #include "dispatch_safety.h"
+#include "return_policy.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -202,6 +203,8 @@ GetInventoryItemId get_inventory_item_id{};
 GetPikminTaskList original_get_pikmin_task_list{};
 GetPikminTaskProto get_pikmin_task_proto{};
 GetTaskFinishTimeMs get_task_finish_time_ms{};
+GetTaskInt get_task_completion_requirement{};
+void *task_completion_requirement_method{};
 GetTaskVariant get_task_finish_location{};
 GetTaskVariant get_task_pikmin_id{};
 GetTaskVariant get_task_carry{};
@@ -217,6 +220,7 @@ GetTaskVariant get_expedition_postcard_with_items{};
 GetTaskVariant get_bloomed_poi_reward_v2{};
 GetTaskVariant get_poi_reward_fruit{};
 GetTaskVariant get_carry_resource{};
+GetTaskVariant get_carry_challenge_info{};
 GetTaskVariant get_carry_pikmin_seed{};
 GetTaskInt get_seed_type{};
 GetTaskVariant get_seed_pikmin{};
@@ -299,6 +303,7 @@ char return_history_path[512]{};
 char return_mode_path[512]{};
 char return_postcard_policy_path[512]{};
 char return_status_path[512]{};
+char return_candidates_path[512]{};
 char return_batch_limit_path[512]{};
 char compatibility_path[512]{};
 char dispatch_candidates_path[512]{};
@@ -670,7 +675,13 @@ std::string describe_return_reward(void *task) {
     if (carry) {
         void *seed = get_carry_pikmin_seed ? get_carry_pikmin_seed(carry, nullptr) : nullptr;
         if (seed) return "carry:" + describe_seed(seed);
-        if (get_carry_resource && get_carry_resource(carry, nullptr)) return "carry:resource";
+        if (get_carry_resource) {
+            void *resource = get_carry_resource(carry, nullptr);
+            if (resource) {
+                const bool mushroom = get_carry_challenge_info && get_carry_challenge_info(carry, nullptr);
+                return std::string(mushroom ? "carry:mushroom-fruit:" : "carry:fruit:") + describe_resource(resource);
+            }
+        }
         return "carry:unknown";
     }
     void *expedition = get_task_expedition ? get_task_expedition(proto, nullptr) : nullptr;
@@ -720,9 +731,8 @@ std::string describe_return_reward(void *task) {
     return result == "bloomed-poi:" ? "bloomed-poi:fruit-list-empty" : result;
 }
 
-// Compact, replace-in-place status for the controller.  Unlike a dispatch
-// trace, "batch-confirmed" is emitted only after the live inventory count
-// decreases, so the APK can distinguish a request from a completed claim.
+// Compact status: confirmation requires the exact pending task to disappear
+// from a complete live inventory snapshot, not an unrelated count decrease.
 void write_return_status(const char *event, int task_count, int completed, bool waiting, bool discard_postcard) {
     FILE *file = std::fopen(return_status_path, "w");
     if (!file) return;
@@ -1599,6 +1609,56 @@ int64_t hooked_get_expedition_total_duration_ms(void *self, void *method_info) {
 
 // Runs on the game's main update thread.  It asks the game's own readiness
 // predicate about each live inventory task and only writes diagnostics.
+bool complete_return_list(void *items, int count) {
+    if (!items || count < 0 || count > kMaxPikminTaskListCount || !get_inventory_item_id ||
+        !get_pikmin_task_proto) return false;
+    const auto capacity = *reinterpret_cast<uintptr_t *>(static_cast<uint8_t *>(items) + 0x18);
+    if (capacity < static_cast<uintptr_t>(count)) return false;
+    for (int i = 0; i < count; ++i) {
+        void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + i * sizeof(void *));
+        if (!task || utf8_string(get_inventory_item_id(task, nullptr)).empty() ||
+            !get_pikmin_task_proto(task, nullptr)) return false;
+    }
+    return true;
+}
+
+bool return_proto_ready(void *proto, long long now) {
+    if (!proto || !get_task_finish_time_ms) return false;
+    const auto finish = get_task_finish_time_ms(proto, nullptr);
+    const int task_case = get_task_case ? get_task_case(proto, nullptr) : -1;
+    const int requirement = get_task_completion_requirement
+            ? get_task_completion_requirement(proto, task_completion_requirement_method) : -1;
+    void *carry = task_case == 1 && get_task_carry ? get_task_carry(proto, nullptr) : nullptr;
+    const bool resource = carry && get_carry_resource && get_carry_resource(carry, nullptr);
+    return pikmin::return_task_ready(task_case, requirement, resource, finish, now);
+}
+
+// Read-only snapshot also runs in off/dry-run. No new hooks or generic iterators.
+void write_return_candidates(void *items, int count, long long now) {
+    if (!complete_return_list(items, count)) return;
+    const std::string temporary = std::string(return_candidates_path) + ".tmp";
+    FILE *file = std::fopen(temporary.c_str(), "w");
+    if (!file) return;
+    std::fprintf(file, "v1\t%lld\t%d\n", now, getpid());
+    for (int i = 0; i < count; ++i) {
+        void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + i * sizeof(void *));
+        void *proto = get_pikmin_task_proto(task, nullptr);
+        const auto id = utf8_string(get_inventory_item_id(task, nullptr));
+        const int requirement = get_task_completion_requirement
+                ? get_task_completion_requirement(proto, task_completion_requirement_method) : -1;
+        const auto detail = describe_return_reward(task);
+        std::fprintf(file, "%s\t%d\t%d\t%lld\t%d\t%s\n", id.c_str(),
+                get_task_case ? get_task_case(proto, nullptr) : -1, requirement,
+                static_cast<long long>(get_task_finish_time_ms ? get_task_finish_time_ms(proto, nullptr) : 0),
+                return_proto_ready(proto, now) ? 1 : 0, detail.c_str());
+    }
+    std::fprintf(file, "end\t%d\n", count);
+    const bool ok = std::fflush(file) == 0 && !std::ferror(file);
+    const bool closed = std::fclose(file) == 0;
+    if (ok && closed && chmod(temporary.c_str(), 0644) == 0)
+        std::rename(temporary.c_str(), return_candidates_path);
+}
+
 void dry_run_return_tasks() {
     const long long now = now_ms();
     if (now - last_return_dry_run_ms < 5000) return;
@@ -1626,6 +1686,7 @@ void dry_run_return_tasks() {
     }
     int ready_count{};
     int due_count{};
+    write_return_candidates(items, count, now);
     for (int index = 0; index < count; ++index) {
         void *task = *reinterpret_cast<void **>(static_cast<uint8_t *>(items) + 0x20 + index * sizeof(void *));
         if (!task) continue;
@@ -1834,6 +1895,10 @@ void install_return_diagnostic_hook() {
     }
     get_pikmin_task_proto = reinterpret_cast<GetPikminTaskProto>(proto_entry);
     get_task_finish_time_ms = reinterpret_cast<GetTaskFinishTimeMs>(finish_entry);
+    task_completion_requirement_method = proto_class
+            ? class_get_method_from_name(proto_class, "get_CompletionRequirement", 0) : nullptr;
+    get_task_completion_requirement = task_completion_requirement_method
+            ? reinterpret_cast<GetTaskInt>(*reinterpret_cast<void **>(task_completion_requirement_method)) : nullptr;
     void *finish_location_method = proto_class
             ? class_get_method_from_name(proto_class, "get_FinishLocation", 0) : nullptr;
     get_task_finish_location = finish_location_method
@@ -1936,6 +2001,8 @@ void install_return_diagnostic_hook() {
     void *carry_class = find_class("Ichigo.Proto", "CarryTaskProto");
     void *carry_resource = carry_class ? class_get_method_from_name(carry_class, "get_Resource", 0) : nullptr;
     void *carry_seed = carry_class ? class_get_method_from_name(carry_class, "get_PikminSeed", 0) : nullptr;
+    void *carry_challenge = carry_class ? class_get_method_from_name(carry_class, "get_ChallengeInfo", 0) : nullptr;
+    get_carry_challenge_info = carry_challenge ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(carry_challenge)) : nullptr;
     get_carry_resource = carry_resource ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(carry_resource)) : nullptr;
     get_carry_pikmin_seed = carry_seed ? reinterpret_cast<GetTaskVariant>(*reinterpret_cast<void **>(carry_seed)) : nullptr;
     void *seed_class = find_class("Ichigo.Proto", "PikminSeedProto");
@@ -3003,10 +3070,10 @@ void maybe_dispatch_one_return_task() {
     if (!list) return;
     void *items = *reinterpret_cast<void **>(static_cast<uint8_t *>(list) + 0x10);
     const int count = *reinterpret_cast<int *>(static_cast<uint8_t *>(list) + 0x18);
-    if (!items || count < 0 || count > kMaxPikminTaskListCount) return;
+    if (!complete_return_list(items, count)) return;
     if (return_one_waiting) {
         const bool pending_seen = task_list_contains_id(items, count, return_batch_pending_id);
-        if (count < return_one_baseline_count || !pending_seen) {
+        if (pikmin::return_confirmed(true, pending_seen)) {
             return_one_waiting = false;
             write_return_status("one-confirmed", count, 1, false, return_discard_postcard());
             return_batch_pending_id.clear();
@@ -3021,7 +3088,7 @@ void maybe_dispatch_one_return_task() {
         if (!task) continue;
         void *proto = get_pikmin_task_proto(task, nullptr);
         const int64_t finish_ms = proto ? get_task_finish_time_ms(proto, nullptr) : 0;
-        if (finish_ms <= 0 || finish_ms > now) continue;
+        if (!return_proto_ready(proto, now)) continue;
         void *task_id = get_inventory_item_id(task, nullptr);
         if (!task_id) continue;
         return_one_dispatched = true;
@@ -3075,11 +3142,11 @@ void maybe_dispatch_return_batch() {
     if (!list) return;
     void *items = *reinterpret_cast<void **>(static_cast<uint8_t *>(list) + 0x10);
     const int count = *reinterpret_cast<int *>(static_cast<uint8_t *>(list) + 0x18);
-    if (!items || count < 0 || count > kMaxPikminTaskListCount) return;
+    if (!complete_return_list(items, count)) return;
     const long long now = now_ms();
     if (return_batch_waiting) {
         const bool pending_seen = task_list_contains_id(items, count, return_batch_pending_id);
-        if (count < return_batch_baseline_count || !pending_seen) {
+        if (pikmin::return_confirmed(true, pending_seen)) {
             return_batch_waiting = false;
             ++return_batch_completed;
             LOGI("[RETURN-DIAG] batch confirmed completed=%d", return_batch_completed);
@@ -3109,7 +3176,7 @@ void maybe_dispatch_return_batch() {
         if (!task) continue;
         void *proto = get_pikmin_task_proto(task, nullptr);
         const int64_t finish_ms = proto ? get_task_finish_time_ms(proto, nullptr) : 0;
-        if (finish_ms <= 0 || finish_ms > now) continue;
+        if (!return_proto_ready(proto, now)) continue;
         void *task_id = get_inventory_item_id(task, nullptr);
         if (!task_id) continue;
         return_batch_baseline_count = count;
@@ -3276,6 +3343,7 @@ void start(const char *game_data_dir) {
     std::snprintf(return_mode_path, sizeof(return_mode_path), "/data/local/tmp/pikmin-return-mode.txt");
     std::snprintf(return_postcard_policy_path, sizeof(return_postcard_policy_path), "/data/local/tmp/pikmin-return-postcard-policy.txt");
     std::snprintf(return_status_path, sizeof(return_status_path), "%s/files/return_rpc_status.tsv", game_data_dir);
+    std::snprintf(return_candidates_path, sizeof(return_candidates_path), "%s/files/return_candidates.tsv", game_data_dir);
     std::snprintf(return_batch_limit_path, sizeof(return_batch_limit_path), "/data/local/tmp/pikmin-return-batch-limit.txt");
     std::snprintf(compatibility_path, sizeof(compatibility_path), "%s/files/compatibility_status.tsv", game_data_dir);
     std::snprintf(dispatch_candidates_path, sizeof(dispatch_candidates_path), "%s/files/dispatch_candidates.tsv", game_data_dir);
