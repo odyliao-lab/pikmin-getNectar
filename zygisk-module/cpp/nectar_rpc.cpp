@@ -5,6 +5,7 @@
 #include "managed_gc.h"
 #include "dispatch_safety.h"
 #include "nearby_policy.h"
+#include "nearby_safety.h"
 #include "return_policy.h"
 #include "planter_policy.h"
 
@@ -76,6 +77,10 @@ using ClassGetMethodFromName = void *(*)(void *, const char *, int);
 using ClassGetMethods = void *(*)(void *, void **);
 using ClassGetField = void *(*)(void *, const char *);
 using FieldGetOffset = size_t (*)(void *);
+using FieldGetValue = void (*)(void *, void *, void *);
+using FieldGetType = void *(*)(void *);
+using ClassFromType = void *(*)(void *);
+using ClassValueSize = int32_t (*)(void *, uint32_t *);
 using SendExpeditionRpc = void *(*)(void *, void *, void *, int, void *);
 using MethodGetName = const char *(*)(void *);
 using MethodGetParamCount = uint32_t (*)(void *);
@@ -157,6 +162,10 @@ ClassGetMethodFromName class_get_method_from_name{};
 ClassGetMethods class_get_methods{};
 ClassGetField class_get_field{};
 FieldGetOffset field_get_offset{};
+FieldGetValue field_get_value{};
+FieldGetType field_get_type{};
+ClassFromType class_from_type{};
+ClassValueSize class_value_size{};
 SendExpeditionRpc original_send_expedition_rpc{};
 void *dispatch_request_class{};
 void *dispatch_point_class{};
@@ -317,6 +326,17 @@ char dispatch_mode_path[512]{};
 char dispatch_kinds_path[512]{};
 char nearby_kinds_path[512]{};
 char nearby_status_path[512]{};
+char nearby_gate_status_path[512]{};
+pikmin::NearbyLocationGate nearby_location_gate;
+pikmin::NearbyFix nearby_fix;
+struct NearbySelection {
+    std::string kind;
+    std::vector<std::string> team;
+    long long since{};
+    uint64_t location_epoch{};
+};
+std::map<std::string, NearbySelection> nearby_selections;
+std::map<std::string, std::pair<std::string, long long>> nearby_block_history;
 char dispatch_target_path[512]{};
 char dispatch_ready_path[512]{};
 char dispatch_history_path[512]{};
@@ -463,6 +483,8 @@ double pending_distance{};
 std::string last_result = "none";
 
 long long now_ms();
+long long steady_ms();
+void update_nearby_location(long long wall);
 void *find_class(const char *namespaze, const char *name);
 void log_task_variant_metadata(void *proto);
 bool current_location(double &latitude, double &longitude);
@@ -1006,6 +1028,39 @@ void log_dispatch_enumerable_metadata(void *object, const char *label) {
     }
 }
 
+void nearby_block(const char *phase, const char *kind, const std::string &id, int64_t duration, int picked) {
+    const long long now = now_ms();
+    auto &last = nearby_block_history[id];
+    if (last.first != phase || now-last.second >= 10000) {
+        append_dispatch_history(phase, kind, id, duration, picked);
+        last = {phase, now};
+    }
+}
+
+void submit_armed_expedition(void *data, void *task, const std::string &id, const char *kind,
+                             int64_t duration, int picked) {
+    const long long attempt_now = now_ms();
+    pending_expedition_ms_since_previous_attempt = last_expedition_attempt_started_ms > 0
+            ? attempt_now-last_expedition_attempt_started_ms : -1;
+    last_expedition_attempt_started_ms = attempt_now;
+    dispatch_reservations.sent(id, attempt_now);
+    module_start_call = true;
+    void *result = start_expedition(data, nullptr);
+    module_start_call = false;
+    ArmedDispatchInFlight flight{};
+    flight.task = result;
+    flight.task_handle = result && gchandle_new ? gchandle_new(result, false) : 0;
+    flight.kind = kind; flight.started_ms = now_ms();
+    flight.ms_since_previous_attempt = pending_expedition_ms_since_previous_attempt;
+    flight.seen_this_scan = true;
+    armed_dispatches.emplace(id, std::move(flight));
+    append_dispatch_history("start-requested", kind, id, duration, picked);
+    LOGI("[DISPATCH] start requested task=%s duration=%" PRId64 " picked=%d result=%p canStartAfter=%d finishAfter=%" PRId64,
+            id.c_str(), duration, picked, result,
+            get_expedition_can_try_start ? get_expedition_can_try_start(data, nullptr) : false,
+            get_task_finish_time_ms ? get_task_finish_time_ms(task, nullptr) : 0);
+}
+
 void write_dispatch_candidates(void *list, long long observed_ms) {
     if (!list || !get_pikmin_task_proto || !get_task_finish_time_ms ||
         !get_task_expedition || !get_expedition_target_case) return;
@@ -1023,6 +1078,17 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     const bool armed = dispatch_mode == "armed";
     const bool batch = dispatch_mode == "batch";
     const std::string armed_kind_filter = armed ? read_dispatch_kind_filter() : "all";
+    const bool nearby = armed && armed_kind_filter != "farm";
+    if (nearby) update_nearby_location(now_ms());
+    const bool nearby_ready = nearby_location_gate.ready(steady_ms());
+    for (auto it = nearby_selections.begin(); it != nearby_selections.end();) {
+        if (!nearby || !nearby_ready || it->second.location_epoch != nearby_location_gate.epoch()
+                || steady_ms()-it->second.since > 20000) {
+            nearby_block("nearby-selection-reset", it->second.kind.c_str(), it->first, 0, it->second.team.size());
+            dispatch_reservations.cancel(it->first);
+            it = nearby_selections.erase(it);
+        } else ++it;
+    }
     const unsigned nearby_mask = read_nearby_selection();
     const std::string nearby_tmp = std::string(nearby_status_path) + ".tmp";
     if (FILE *ack = std::fopen(nearby_tmp.c_str(), "w")) {
@@ -1135,8 +1201,10 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 ? get_point_lat_degrees(finish_point, nullptr) : 0.0;
         const double finish_longitude = finish_point && get_point_lng_degrees
                 ? get_point_lng_degrees(finish_point, nullptr) : 0.0;
-        const double distance = has_current_location && (latitude != 0.0 || longitude != 0.0)
-                ? distance_metres(current_latitude, current_longitude, latitude, longitude) : -1.0;
+        const double distance = nearby
+                ? (nearby_fix.valid && point ? distance_metres(nearby_fix.game_lat, nearby_fix.game_lng, latitude, longitude) : -1.0)
+                : (has_current_location && (latitude != 0.0 || longitude != 0.0)
+                    ? distance_metres(current_latitude, current_longitude, latitude, longitude) : -1.0);
         void *data = expedition_data_store && get_expedition_data_by_index
                 ? get_expedition_data_by_index(expedition_data_store, 0, id, nullptr) : nullptr;
         if (data && !expedition_item_metadata_logged && object_get_class) {
@@ -1231,19 +1299,49 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         // Only trustworthy since current_location() now fails closed on a
         // stale fallback file (see kSystemGpsMaxAgeSeconds); at the old 25 m
         // this same reading was once 111 m wrong for over an hour.
-        // Armed mode's own radius: previously a proxy via the game's derived
-        // travel duration (<=5 minutes); now a direct GPS check against the
-        // same distance reading, at the user's request for a literal radius
-        // instead of an indirect time estimate.
+        // Ordinary nearby requires BOTH processed-game 200m radius and
+        // selected-team <=120s duration, on a later live inventory update.
         const double allowed_distance = batch ? 4.0 : 200.0;
         const bool armed_capacity_available = armed &&
                 !dispatch_reservations.has_sent(id_text) &&
                 armed_dispatches.size() < kArmedMaxInFlight &&
                 starts_requested < static_cast<int>(kArmedMaxStartsPerScan) &&
-                armed_inflight == armed_dispatches.end();
+                armed_inflight == armed_dispatches.end() &&
+                (!nearby || (nearby_ready && armed_dispatches.size()+nearby_selections.size() < kArmedMaxInFlight));
         const bool batch_capacity_available = batch && dispatch_confirmation_pending_id.empty();
         const bool batch_selection_pending = batch && !batch_selection_settling_id.empty();
-        if (batch_selection_pending) {
+        auto nearby_pending = nearby_selections.find(id_text);
+        if (nearby && nearby_pending != nearby_selections.end()) {
+            const auto selection = nearby_pending->second;
+            if (steady_ms()-selection.since >= kBatchSelectionSettleMs) {
+                const int64_t live_duration = data && original_get_expedition_total_duration_ms
+                        ? original_get_expedition_total_duration_ms(data, nullptr) : 0;
+                const bool same_team = data && team_is_eligible(selection.team, eligible_ids)
+                        && selected_team_matches(data, selection.team);
+                const bool power = data && get_expedition_has_enough_carrying_power
+                        && get_expedition_has_enough_carrying_power(data, nullptr);
+                update_nearby_location(now_ms());
+                const double live_distance = nearby_fix.valid && point
+                        ? distance_metres(nearby_fix.game_lat, nearby_fix.game_lng, latitude, longitude) : -1;
+                const bool safe = requested && can_start && power && same_team && !gift_pikmin_unavailable
+                        && pikmin::nearby_duration_safe(live_duration) && start_expedition
+                        && nearby_location_gate.ready(steady_ms()) && selection.location_epoch == nearby_location_gate.epoch()
+                        && live_distance >= 0 && live_distance <= 200 && read_dispatch_mode() == "armed"
+                        && read_dispatch_kind_filter() == armed_kind_filter
+                        && pikmin::nearby_kind_allowed(armed_kind_filter, read_nearby_selection(), kind)
+                        && starts_requested < static_cast<int>(kArmedMaxStartsPerScan)
+                        && armed_dispatches.size() < kArmedMaxInFlight;
+                if (safe) {
+                    append_dispatch_selection_diagnostics(kind, id_text, "nearby-pre-start-settled", selection.team.size(),
+                            selection.team.size(), live_duration, can_start, power, "");
+                    submit_armed_expedition(data, task, id_text, kind, live_duration, selection.team.size());
+                    ++starts_requested; start_requested = true;
+                } else nearby_block(!pikmin::nearby_duration_safe(live_duration) ? "nearby-duration-blocked"
+                        : "nearby-start-blocked", kind, id_text, live_duration, selection.team.size());
+                dispatch_reservations.cancel(id_text);
+                nearby_selections.erase(nearby_pending);
+            }
+        } else if (batch_selection_pending) {
             if (id_text == batch_selection_settling_id &&
                 observed_ms - batch_selection_settling_started_ms >= kBatchSelectionSettleMs) {
                 const bool carrying_power_settled = get_expedition_has_enough_carrying_power
@@ -1332,8 +1430,8 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 ++selections_applied;
                 LOGI("[DISPATCH-OBSERVE] armed selection task=%s duration=%" PRId64 " canStart=%d picked=%d carryingPower=%d",
                      id_text.c_str(), game_duration, can_start ? 1 : 0, picked_count, carrying_power_after ? 1 : 0);
-                // Armed keeps its 200m radius. Batch additionally checks the
-                // actual team's <=2s native duration on the later start tick.
+                // Ordinary nearby also waits for a later native tick; farm
+                // retains its existing controller-owned arrival/dwell flow.
                 gift_pikmin_unavailable = is_gift && !can_start;
                 if (can_start && carrying_power_after && start_expedition && selected_team_matches(data, selected_team)) {
                     if (batch) {
@@ -1349,50 +1447,15 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                                                 game_duration, picked_count);
                         LOGI("[DISPATCH] selection settling task=%s waitMs=%lld picked=%d",
                              id_text.c_str(), kBatchSelectionSettleMs, picked_count);
+                    } else if (nearby) {
+                        if (original_get_expedition_total_duration_ms && pikmin::nearby_duration_safe(game_duration)
+                                && get_expedition_has_enough_carrying_power) {
+                            nearby_selections.emplace(id_text, NearbySelection{kind, selected_team, steady_ms(), nearby_location_gate.epoch()});
+                            append_dispatch_history("nearby-selection-settling", kind, id_text, game_duration, picked_count);
+                        } else nearby_block("nearby-duration-blocked", kind, id_text, game_duration, picked_count);
                     } else {
-                    // Recorded before the call so a rate-limit hypothesis for
-                    // the fault rate (see append_rpc_fault_diagnostics) can be
-                    // checked against how soon this attempt followed the last
-                    // one, not just whether it faulted.
-                    const long long attempt_now = now_ms();
-                    pending_expedition_ms_since_previous_attempt = last_expedition_attempt_started_ms > 0
-                            ? attempt_now - last_expedition_attempt_started_ms : -1;
-                    last_expedition_attempt_started_ms = attempt_now;
-                    dispatch_reservations.sent(id_text, attempt_now);
-                    module_start_call = true;
-                    void *start_result = start_expedition(data, nullptr);
-                    module_start_call = false;
-                    const bool can_start_after = get_expedition_can_try_start
-                            ? get_expedition_can_try_start(data, nullptr) : false;
-                    const int64_t finish_after = get_task_finish_time_ms
-                            ? get_task_finish_time_ms(task, nullptr) : 0;
-                    start_requested = true;
-                    ++starts_requested;
-                    if (batch) {
-                        dispatch_confirmation_pending_id = id_text;
-                        dispatch_confirmation_started_observed_ms = observed_ms;
-                    } else {
-                        ArmedDispatchInFlight in_flight{};
-                        in_flight.task = start_result;
-                        in_flight.task_handle = start_result && gchandle_new
-                                ? gchandle_new(start_result, false) : 0;
-                        in_flight.kind = kind;
-                        in_flight.started_ms = now_ms();
-                        in_flight.ms_since_previous_attempt = pending_expedition_ms_since_previous_attempt;
-                        in_flight.seen_this_scan = true;
-                        armed_dispatches.emplace(id_text, std::move(in_flight));
-                    }
-                    if (batch && start_result && gchandle_new) {
-                        pending_expedition_task = start_result;
-                        pending_expedition_task_handle = gchandle_new(start_result, false);
-                        pending_expedition_task_id = id_text;
-                        pending_expedition_task_kind = kind;
-                        pending_expedition_task_started_ms = now_ms();
-                    }
-                    append_dispatch_history("start-requested", kind, id_text, game_duration, picked_count);
-                    LOGI("[DISPATCH] start requested task=%s duration=%" PRId64 " picked=%d result=%p canStartAfter=%d finishAfter=%" PRId64,
-                         id_text.c_str(), game_duration, picked_count, start_result,
-                         can_start_after ? 1 : 0, finish_after);
+                        submit_armed_expedition(data, task, id_text, kind, game_duration, picked_count);
+                        start_requested = true; ++starts_requested;
                     }
                 } else if (batch_ready && id_text == batch_target && gift_pikmin_unavailable &&
                            dispatch_last_gift_skip_id != id_text) {
@@ -1402,7 +1465,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                                             game_duration, picked_count);
                     dispatch_last_gift_skip_id = id_text;
                 }
-                if (!batch || batch_selection_settling_id != id_text) dispatch_reservations.cancel(id_text);
+                if ((!batch || batch_selection_settling_id != id_text) && !nearby_selections.count(id_text)) dispatch_reservations.cancel(id_text);
             } else {
                 append_dispatch_history("selected-team-unavailable", kind, id_text, game_duration, picked_count);
             }
@@ -1468,7 +1531,18 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
             ++it;
         }
     }
-    if (complete_task_projection) dispatch_reservations.reconcile_tasks(live_task_ids, observed_ms);
+    if (complete_task_projection) {
+        dispatch_reservations.reconcile_tasks(live_task_ids, observed_ms);
+        for (auto it = nearby_selections.begin(); it != nearby_selections.end();) {
+            if (!live_task_ids.count(it->first)) {
+                dispatch_reservations.cancel(it->first);
+                it = nearby_selections.erase(it);
+            } else ++it;
+        }
+        for (auto it = nearby_block_history.begin(); it != nearby_block_history.end();) {
+            if (!live_task_ids.count(it->first)) it = nearby_block_history.erase(it); else ++it;
+        }
+    }
     std::fclose(file);
     chmod(dispatch_candidates_path, 0644);
     // Separate versioned advisory file keeps the existing 12-column contract.
@@ -2464,6 +2538,79 @@ void maybe_manage_planting() {
     write_planting_control_status(mode, planting, planting_control_last_action.c_str());
 }
 
+// Read-only IL2CPP field API: no guessed v152 offsets, new hooks, managed
+// getters, generic invocations or system-GPS fallback in nearby authorization.
+void *nearby_value_class(void *field, const char *name, int size) {
+    if (!field || !field_get_type || !class_from_type || !class_value_size) return nullptr;
+    void *klass = class_from_type(field_get_type(field));
+    const char *actual = klass && class_get_name ? class_get_name(klass) : nullptr;
+    uint32_t align{};
+    return actual && std::strcmp(actual, name) == 0 && class_value_size(klass, &align) == size ? klass : nullptr;
+}
+
+long long steady_ms() {
+    timespec value{}; clock_gettime(CLOCK_MONOTONIC, &value);
+    return static_cast<long long>(value.tv_sec)*1000LL + value.tv_nsec/1000000LL;
+}
+
+pikmin::NearbyFix read_nearby_game_fix() {
+    pikmin::NearbyFix result;
+    if (!runtime_metadata_ready || !location_controller || !object_get_class || !class_get_field || !field_get_offset || !field_get_value) return result;
+    void *klass = object_get_class(location_controller);
+    static void *checked_class{}, *raw_field{}, *processed_field{}, *time_field{};
+    static bool layout_ok{};
+    if (klass != checked_class) {
+        checked_class = klass; layout_ok = false;
+        raw_field = class_get_field(klass, "latestRawLocation");
+        processed_field = class_get_field(klass, "<LatestDeviceLocation>k__BackingField");
+        time_field = class_get_field(klass, "latestRawLocationWallTimeMs");
+        void *raw_class = nearby_value_class(raw_field, "LatLngAlt", 24);
+        void *processed_class = nearby_value_class(processed_field, "DeviceLocation", 32);
+        void *location = processed_class ? class_get_field(processed_class, "Location") : nullptr;
+        void *fake = processed_class ? class_get_field(processed_class, "IsFakeLocation") : nullptr;
+        void *accuracy = processed_class ? class_get_field(processed_class, "AccuracyMeters") : nullptr;
+        void *latlng = raw_class ? class_get_field(raw_class, "LatLng") : nullptr;
+        void *altitude = raw_class ? class_get_field(raw_class, "AltitudeMeters") : nullptr;
+        void *latlng_class = nearby_value_class(latlng, "LatLng", 16);
+        void *lat = latlng_class ? class_get_field(latlng_class, "Lat") : nullptr;
+        void *lng = latlng_class ? class_get_field(latlng_class, "Lng") : nullptr;
+        // Value-class offsets may include the two-pointer object header.
+        const auto first = [](void *f) { return f && (field_get_offset(f) == 0 || field_get_offset(f) == 16); };
+        layout_ok = raw_class && processed_class && nearby_value_class(time_field, "Int64", 8)
+                && nearby_value_class(location, "LatLngAlt", 24) == raw_class
+                && first(location) && fake && accuracy
+                && field_get_offset(fake) == field_get_offset(location)+24
+                && field_get_offset(accuracy) == field_get_offset(location)+28
+                && first(latlng) && altitude && field_get_offset(altitude) == field_get_offset(latlng)+16
+                && first(lat) && lng && field_get_offset(lng) == field_get_offset(lat)+8
+                && nearby_value_class(lat, "Double", 8) && nearby_value_class(lng, "Double", 8);
+        LOGI("[NEARBY-GPS] runtime fields verified=%d raw=%p processed=%p time=%p", layout_ok ? 1 : 0,
+                raw_field, processed_field, time_field);
+    }
+    if (!layout_ok) return result;
+    double raw[3]{}, processed[4]{};
+    field_get_value(location_controller, raw_field, raw);
+    field_get_value(location_controller, processed_field, processed);
+    field_get_value(location_controller, time_field, &result.raw_wall_ms);
+    result.valid = true; result.raw_lat = raw[0]; result.raw_lng = raw[1];
+    result.game_lat = processed[0]; result.game_lng = processed[1];
+    return result;
+}
+
+void update_nearby_location(long long wall) {
+    nearby_fix = read_nearby_game_fix();
+    nearby_location_gate.observe(nearby_fix, wall, steady_ms());
+    const std::string temp = std::string(nearby_gate_status_path) + ".tmp";
+    if (FILE *file = std::fopen(temp.c_str(), "w")) {
+        std::fprintf(file, "v1\t%lld\t%d\t%s\t%llu\t%u\t%.7f\t%.7f\t%.7f\t%.7f\t%lld\t120000\n",
+                wall, getpid(), nearby_location_gate.reason(), static_cast<unsigned long long>(nearby_location_gate.epoch()),
+                nearby_location_gate.samples(), nearby_fix.raw_lat, nearby_fix.raw_lng,
+                nearby_fix.game_lat, nearby_fix.game_lng, static_cast<long long>(nearby_fix.raw_wall_ms));
+        const bool ok = std::fclose(file) == 0;
+        if (ok && chmod(temp.c_str(), 0644) == 0) std::rename(temp.c_str(), nearby_gate_status_path);
+    }
+}
+
 bool current_location(double &latitude, double &longitude) {
     void *candidates[3]{location_controller, nullptr, nullptr};
     if (interaction_settings) {
@@ -2768,6 +2915,7 @@ void maybe_claim() {
     const long long current = now_ms();
     if (current - last_tick_ms < 1000) return;
     last_tick_ms = current;
+    update_nearby_location(current);
     const std::string mode = read_mode();
     poll_pending_task();
     poll_pending_expedition_task();
@@ -3339,6 +3487,10 @@ void start(const char *game_data_dir) {
     class_get_methods = reinterpret_cast<ClassGetMethods>(xdl_sym(handle, "il2cpp_class_get_methods", nullptr));
     class_get_field = reinterpret_cast<ClassGetField>(xdl_sym(handle, "il2cpp_class_get_field_from_name", nullptr));
     field_get_offset = reinterpret_cast<FieldGetOffset>(xdl_sym(handle, "il2cpp_field_get_offset", nullptr));
+    field_get_value = reinterpret_cast<FieldGetValue>(xdl_sym(handle, "il2cpp_field_get_value", nullptr));
+    field_get_type = reinterpret_cast<FieldGetType>(xdl_sym(handle, "il2cpp_field_get_type", nullptr));
+    class_from_type = reinterpret_cast<ClassFromType>(xdl_sym(handle, "il2cpp_class_from_type", nullptr));
+    class_value_size = reinterpret_cast<ClassValueSize>(xdl_sym(handle, "il2cpp_class_value_size", nullptr));
     method_get_name = reinterpret_cast<MethodGetName>(xdl_sym(handle, "il2cpp_method_get_name", nullptr));
     method_get_param_count = reinterpret_cast<MethodGetParamCount>(xdl_sym(handle, "il2cpp_method_get_param_count", nullptr));
     object_new = reinterpret_cast<ObjectNew>(xdl_sym(handle, "il2cpp_object_new", nullptr));
@@ -3380,6 +3532,7 @@ void start(const char *game_data_dir) {
     std::snprintf(dispatch_kinds_path, sizeof(dispatch_kinds_path), "/data/local/tmp/pikmin-dispatch-kinds.txt");
     std::snprintf(nearby_kinds_path, sizeof(nearby_kinds_path), "/data/local/tmp/pikmin-nearby-kinds.txt");
     std::snprintf(nearby_status_path, sizeof(nearby_status_path), "%s/files/nearby_dispatch_status.tsv", game_data_dir);
+    std::snprintf(nearby_gate_status_path, sizeof(nearby_gate_status_path), "%s/files/nearby_gate_status.tsv", game_data_dir);
     std::snprintf(dispatch_target_path, sizeof(dispatch_target_path), "/data/local/tmp/pikmin-dispatch-target.txt");
     std::snprintf(dispatch_ready_path, sizeof(dispatch_ready_path), "/data/local/tmp/pikmin-dispatch-ready.tsv");
     std::snprintf(dispatch_history_path, sizeof(dispatch_history_path), "%s/files/dispatch_history.tsv", game_data_dir);
