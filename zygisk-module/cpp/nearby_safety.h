@@ -7,7 +7,7 @@ inline bool nearby_duration_safe(int64_t ms) { return ms > 0 && ms <= 120000; }
 struct NearbyFix {
     bool valid{};
     double raw_lat{}, raw_lng{}, game_lat{}, game_lng{};
-    int64_t raw_wall_ms{};
+    int64_t raw_wall_ms{}; // Game field name; CLOCK_BOOTTIME milliseconds, not Unix time.
 };
 inline bool valid_point(double lat, double lng) {
     return std::isfinite(lat) && std::isfinite(lng) && std::abs(lat) <= 90 && std::abs(lng) <= 180;
@@ -24,7 +24,7 @@ inline double nearby_metres(double a, double b, double c, double d) {
 class NearbyLocationGate {
     bool anchored_{};
     double anchor_lat_{}, anchor_lng_{};
-    int64_t since_{}, last_seen_{}, last_fix_{}, last_wall_{};
+    int64_t since_{}, last_seen_{}, last_fix_{}, last_elapsed_{};
     unsigned samples_{};
     uint64_t epoch_{};
     const char *reason_{"waiting-game-location"};
@@ -33,14 +33,16 @@ public:
         anchored_ = false; samples_ = 0; since_ = last_fix_ = 0;
         reason_ = reason; ++epoch_;
     }
-    void observe(const NearbyFix &f, int64_t wall, int64_t steady) {
+    // elapsed must share the game's boot-time clock (includes device suspend).
+    // steady is monotonic time for cross-tick selection/heartbeat intervals.
+    void observe(const NearbyFix &f, int64_t elapsed, int64_t steady) {
         if ((last_seen_ && (steady < last_seen_ || steady-last_seen_ > 5000)) ||
-                (last_wall_ && wall < last_wall_)) reset("location-gap");
-        last_seen_ = steady; last_wall_ = wall;
+                (last_elapsed_ && elapsed < last_elapsed_)) reset("location-gap");
+        last_seen_ = steady; last_elapsed_ = elapsed;
         if (!f.valid || !valid_point(f.raw_lat, f.raw_lng) || !valid_point(f.game_lat, f.game_lng)) {
             reset("waiting-game-location"); return;
         }
-        if (f.raw_wall_ms <= 0 || f.raw_wall_ms > wall || wall-f.raw_wall_ms > 5000) {
+        if (elapsed <= 0 || f.raw_wall_ms <= 0 || f.raw_wall_ms > elapsed || elapsed-f.raw_wall_ms > 5000) {
             reset("stale-game-location"); return;
         }
         if (nearby_metres(f.raw_lat, f.raw_lng, f.game_lat, f.game_lng) > 8.0) {

@@ -2,11 +2,20 @@
 
 ## 部署狀態（實機驗收前檢查點）
 
-- Native `1.4.20 / 54` 已編譯、封裝並由 Magisk 安裝到 `modules_update`，**仍須重開機才載入**。
+- **19:45 實機續驗後，最新候選為 Native `1.4.21 / 55`**：已編譯、7組原生policy與5處MethodInfo檢查通過，並由 Magisk 安裝到 `modules_update`，**仍須再次重開機才載入**。APK維持0.6.15，不必重装。
 - Control Center `0.6.15 / 32` 已同簽章覆蓋安裝。
 - 目標 `192.168.50.202:5555`、Android14、24095PCADG。操作前 `adb devices` 已確認；未操作其它裝置。
 - 原遊戲 PID4203、native1.4.19/SO hash 已備份。現在 `/data/local/tmp/pikmin-dispatch-mode.txt` 為 **off / 0644**，只暫停附近派遣；沒有改 JoyStick、GPS座標、返程／育苗或精華設定。
 - **已請使用者重開機／解鎖／開啟遊戲，先保持附近派遣關閉、不移動 GPS。尚未宣稱新原生 runtime 欄位或實際派遣驗收成功。**
+
+### 19:45 重開後實測：欄位成功，時鐘需修正
+
+- 首次遊戲 PID11292 有Zygisk `detect game`，但120秒等待耗盡，記錄 `libil2cpp.so was not loaded`；沒有新heartbeat。後來核心庫已出現在maps，不能拿module.prop或舊TSV當成功。只重啟遊戲後PID19519於19:45:41成功安裝hooks、19:45:50記錄 `[NEARBY-GPS] runtime fields verified=1`。冷啟動等待逾時獨立列為待觀察，本次未修改loader或新增hook。
+- 新guard同PID持續更新，但始終`stale-game-location`。實際raw與processed同為24.1663475,120.6338120；raw時間755828，而Unix時間1788695172167、系統uptime約757秒。1.4.20錯把遊戲欄位名稱中的WallTime當Unix時間，導致安全拒派，並非新誤派。
+- 唯讀拉取該手機的`libichigonative.so`（SHA256 `896d46b45c7f2d63778220070ca63601f24a750f7e5b95e77df04207b7715d0e`），反組譯匯出`WallTime_GetElapsedWallTimeNanos` 0x32a340→0x32a29c，確認0x32a2bc設定clock id7，再呼叫clock_gettime，即CLOCK_BOOTTIME（包含休眠）。沒有提交遊戲二進位。
+- 1.4.21只把raw freshness比較改用CLOCK_BOOTTIME；讀取失敗仍拒派，不自動校正offset、不退回raw/system GPS。跨tick計時仍用CLOCK_MONOTONIC；TSV第2欄仍是Unix heartbeat，第11欄保留遊戲原始boot-time ms。CC只用第2欄檢查heartbeat，APK協定無須改版。
+- 新增實機時間數值、boot與monotonic不同、休眠後舊fix、clock失敗、誤用Unix／monotonic的測試。7組arm64測試通過是policy驗證，**1.4.21靜止ready、分段跳點阻擋及實際送出／收回仍待重開後驗收**。
+- 新ZIP SHA256 `a885b86120b086a9ab42428feb67e7829da28cb473e014244be618f6df067343`；新SO `b3d8ee978390c220e6cc5b068816206294646e53a4be77ea57fbb6ef19850807`，已比對modules_update內容。原備份目錄新增`rollback-native-1.4.20.zip`，1.4.19備份保留。現在遊戲仍跑1.4.20，附近off/0644；未移動GPS、未送出測試派遣。
 
 ## 原因與使用者確認
 
@@ -34,7 +43,7 @@
 
 新 `files/nearby_gate_status.tsv`：12欄
 
-`v1 / wall_ms / pid / state / epoch / distinct_samples / raw_lat / raw_lng / processed_lat / processed_lng / raw_wall_ms / 120000`
+`v1 / unix_wall_ms / pid / state / epoch / distinct_samples / raw_lat / raw_lng / processed_lat / processed_lng / raw_boot_ms / 120000`
 
 state包含`waiting-game-location`、`stale-game-location`、`game-location-catching-up`、`location-settling`、`ready`等。每秒原子更新0644；來源只能是遊戲欄位，不是JoyStick目標或system fallback。
 
@@ -52,7 +61,7 @@ CC只接受同PID、10秒內、v1／12欄、limit120000的guard heartbeat；缺�
 
 ## 必須接續的實機驗收
 
-1. 重開機後 `adb devices`、型號、module.prop1.4.20及實際SO hash；重新開遊戲，先保持dispatch off。
+1. 重開機後 `adb devices`、型號、module.prop1.4.21及實際SO hash；重新開遊戲，先保持dispatch off。若再遇loader120秒逾時，先檢查核心庫／登入狀態，不可把舊TSV當新heartbeat。
 2. 檢查`[NEARBY-GPS] runtime fields verified=1`及新guard TSV同PID。若verified=0、讀不到或時間不合，**不得退回raw/system授權**，保持off研究欄位／時鐘。
 3. 靜止時raw與processed對齊，distinct_samples≥3、state=ready；仍不代表Start已驗證。
 4. 使用者操作遠距離跳點時先off觀察：raw先變、processed分段追趕，ready應失效／epoch改變，最後才恢復。記錄真實raw／processed／原生時間；不要拿先前手動位移冒稱新測試。
@@ -62,6 +71,7 @@ CC只接受同PID、10秒內、v1／12欄、limit120000的guard heartbeat；缺�
 
 ## 產物与回退
 
+- 以下是1.4.20原始產物；**最新1.4.21 hash與續驗狀態見本文上方**。
 - ZIP SHA256 `0baadd539a48556b08f9822cbef791bc0076ad3f37687d8b5d0134689df1abb0`
 - SO SHA256 `03980696b07f7b8db81bbfc19361ae226f1d1031ac1cfa0710f76ae43e0b4a46`
 - APK SHA256 `18116948ca7684872d682af558a49fce97dc33db3825d0dbc83118b284fe9014`

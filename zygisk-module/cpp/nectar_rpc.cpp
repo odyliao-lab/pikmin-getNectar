@@ -2553,6 +2553,15 @@ long long steady_ms() {
     return static_cast<long long>(value.tv_sec)*1000LL + value.tv_nsec/1000000LL;
 }
 
+long long nearby_elapsed_ms() {
+    // v152 libichigonative WallTime_GetElapsedWallTimeNanos uses clock id 7:
+    // CLOCK_BOOTTIME, including suspend. latestRawLocationWallTimeMs is NOT
+    // Unix time. Refuse clock errors; never infer an epoch offset from a fix.
+    timespec value{};
+    if (clock_gettime(CLOCK_BOOTTIME, &value) != 0) return -1;
+    return static_cast<long long>(value.tv_sec)*1000LL + value.tv_nsec/1000000LL;
+}
+
 pikmin::NearbyFix read_nearby_game_fix() {
     pikmin::NearbyFix result;
     if (!runtime_metadata_ready || !location_controller || !object_get_class || !class_get_field || !field_get_offset || !field_get_value) return result;
@@ -2599,7 +2608,7 @@ pikmin::NearbyFix read_nearby_game_fix() {
 
 void update_nearby_location(long long wall) {
     nearby_fix = read_nearby_game_fix();
-    nearby_location_gate.observe(nearby_fix, wall, steady_ms());
+    nearby_location_gate.observe(nearby_fix, nearby_elapsed_ms(), steady_ms());
     const std::string temp = std::string(nearby_gate_status_path) + ".tmp";
     if (FILE *file = std::fopen(temp.c_str(), "w")) {
         std::fprintf(file, "v1\t%lld\t%d\t%s\t%llu\t%u\t%.7f\t%.7f\t%.7f\t%.7f\t%lld\t120000\n",

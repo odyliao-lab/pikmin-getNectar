@@ -40,5 +40,20 @@ int main() {
     for (int i=0;i<4;++i) { origin.raw_wall_ms+=1000; zero.observe(origin,origin.raw_wall_ms,origin.raw_wall_ms); }
     assert(zero.ready(5000)); // equator/prime meridian are valid coordinates
     epoch=zero.epoch(); zero.observe(origin,4000,6000); assert(!zero.ready(6000) && epoch!=zero.epoch());
-    puts("PASS nearby safety: 120s boundaries, recorded 144h failures, 3-4 stage teleport, repeated/stale/future/invalid fixes, rollback and heartbeat");
+    // Real v152 sample: Unix=1788695172167, boot time ~757000, raw=755828.
+    // Monotonic can differ from boot time after suspend; never use either
+    // Unix or monotonic for raw-fix age, nor calibrate stale input to 'now'.
+    NearbyLocationGate boot;
+    NearbyFix actual{true,24.1663475,120.6338120,24.1663475,120.6338120,755828};
+    for (int i=0; i<4; ++i) {
+        actual.raw_wall_ms=755828+i*1000;
+        boot.observe(actual,757000+i*1000,700000+i*1000);
+    }
+    assert(boot.ready(703000));
+    boot.observe(actual,821000,703001); // one minute suspended, stale raw fix
+    assert(!boot.ready(703001));
+    boot.observe(actual,-1,703002); assert(!boot.ready(703002));
+    boot.observe(actual,1788695172167LL,703003); assert(!boot.ready(703003));
+    boot.observe(actual,700000,703004); assert(!boot.ready(703004)); // wrong clock/future
+    puts("PASS nearby safety: 120s boundaries, 144h failures, staged teleport, stale/future fixes, real boot-time sample and suspend");
 }
