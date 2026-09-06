@@ -3,7 +3,8 @@
 #include <cstdint>
 
 namespace pikmin {
-inline bool nearby_duration_safe(int64_t ms) { return ms > 0 && ms <= 120000; }
+inline constexpr int64_t kNearbyMaxDurationMs = 300000;
+inline bool nearby_duration_safe(int64_t ms) { return ms > 0 && ms <= kNearbyMaxDurationMs; }
 struct NearbyFix {
     bool valid{};
     double raw_lat{}, raw_lng{}, game_lat{}, game_lng{};

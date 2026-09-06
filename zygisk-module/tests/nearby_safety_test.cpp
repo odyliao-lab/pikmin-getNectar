@@ -6,8 +6,8 @@
 #include <initializer_list>
 using namespace pikmin;
 int main() {
-    for (int64_t ms : {-2000, -1, 0, 120001, 300000, 519535566, 519560925, 519568240}) assert(!nearby_duration_safe(ms));
-    assert(nearby_duration_safe(1) && nearby_duration_safe(2000) && nearby_duration_safe(120000));
+    for (int64_t ms : {-2000, -1, 0, 300001, 519535566, 519560925, 519568240}) assert(!nearby_duration_safe(ms));
+    for (int64_t ms : {1, 2000, 120000, 120001, 180000, 299999, 300000}) assert(nearby_duration_safe(ms));
     NearbyLocationGate gate;
     NearbyFix taiwan{true,25,121,25,121,10000};
     gate.observe(taiwan,10000,10000); assert(!gate.ready(10000));
@@ -55,5 +55,5 @@ int main() {
     boot.observe(actual,-1,703002); assert(!boot.ready(703002));
     boot.observe(actual,1788695172167LL,703003); assert(!boot.ready(703003));
     boot.observe(actual,700000,703004); assert(!boot.ready(703004)); // wrong clock/future
-    puts("PASS nearby safety: 120s boundaries, 144h failures, staged teleport, stale/future fixes, real boot-time sample and suspend");
+    puts("PASS nearby safety: 300s inclusive boundary, 300001ms rejected, 144h failures, staged teleport, stale/future fixes, real boot-time sample and suspend");
 }

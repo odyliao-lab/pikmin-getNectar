@@ -1300,7 +1300,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         // stale fallback file (see kSystemGpsMaxAgeSeconds); at the old 25 m
         // this same reading was once 111 m wrong for over an hour.
         // Ordinary nearby requires BOTH processed-game 200m radius and
-        // selected-team <=120s duration, on a later live inventory update.
+        // selected-team <=300s duration, on a later live inventory update.
         const double allowed_distance = batch ? 4.0 : 200.0;
         const bool armed_capacity_available = armed &&
                 !dispatch_reservations.has_sent(id_text) &&
@@ -2611,10 +2611,11 @@ void update_nearby_location(long long wall) {
     nearby_location_gate.observe(nearby_fix, nearby_elapsed_ms(), steady_ms());
     const std::string temp = std::string(nearby_gate_status_path) + ".tmp";
     if (FILE *file = std::fopen(temp.c_str(), "w")) {
-        std::fprintf(file, "v1\t%lld\t%d\t%s\t%llu\t%u\t%.7f\t%.7f\t%.7f\t%.7f\t%lld\t120000\n",
+        std::fprintf(file, "v1\t%lld\t%d\t%s\t%llu\t%u\t%.7f\t%.7f\t%.7f\t%.7f\t%lld\t%lld\n",
                 wall, getpid(), nearby_location_gate.reason(), static_cast<unsigned long long>(nearby_location_gate.epoch()),
                 nearby_location_gate.samples(), nearby_fix.raw_lat, nearby_fix.raw_lng,
-                nearby_fix.game_lat, nearby_fix.game_lng, static_cast<long long>(nearby_fix.raw_wall_ms));
+                nearby_fix.game_lat, nearby_fix.game_lng, static_cast<long long>(nearby_fix.raw_wall_ms),
+                static_cast<long long>(pikmin::kNearbyMaxDurationMs));
         const bool ok = std::fclose(file) == 0;
         if (ok && chmod(temp.c_str(), 0644) == 0) std::rename(temp.c_str(), nearby_gate_status_path);
     }
