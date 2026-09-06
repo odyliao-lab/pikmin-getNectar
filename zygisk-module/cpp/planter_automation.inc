@@ -13,6 +13,16 @@ Param param{};
 FromType from_type{};
 char snapshot_path[512]{}, state_path[512]{}, history_path[512]{}, pending_path[512]{};
 constexpr const char *control_path = "/data/local/tmp/pikmin-planter-mode.txt";
+constexpr const char *steps_path = "/data/local/tmp/pikmin-planter-steps.txt";
+unsigned selected_steps() {
+    FILE *file = std::fopen(steps_path, "r");
+    if (!file) return errno == ENOENT ? pikmin::planter::default_steps : 0;
+    char buffer[130]{};
+    const size_t length = std::fread(buffer, 1, sizeof(buffer), file);
+    const bool failed = std::ferror(file) != 0;
+    std::fclose(file);
+    return failed || length > 128 ? 0 : pikmin::planter::parse_steps(std::string(buffer, length));
+}
 bool ok{}, initialized{}, compatible{}, restart_blocked{};
 void *seed_list_method{}, *ready_method{}, *pull_method{}, *plant_method{};
 void *pull_class{}, *plant_class{}, *option_class{};
@@ -210,6 +220,8 @@ void write_snapshot(const Snapshot &s) {
     if (!s.complete) return; // Never overwrite a complete snapshot with a partial one.
     std::string out = "v1\t" + std::to_string(now_ms()) + "\t" + std::to_string(getpid()) +
             "\t" + std::to_string(s.pikmins.size()) + "\t" + std::to_string(s.capacity) + "\n";
+    const unsigned steps = selected_steps();
+    out += "steps\t" + std::to_string(steps) + "\n";
     for (const Slot &slot : s.slots) {
         auto found = s.seeds.find(slot.seed);
         Seed v = found == s.seeds.end() ? Seed{} : found->second;
@@ -219,7 +231,8 @@ void write_snapshot(const Snapshot &s) {
     }
     for (const auto &[id, v] : s.seeds)
         out += "seed\t" + id + "\t" + std::to_string(v.planted) + "\t" + std::to_string(v.required) +
-                "\t" + (v.starred ? "1" : "0") + "\t" + (v.special ? "1" : "0") + "\t" + v.label + "\n";
+                "\t" + (v.starred ? "1" : "0") + "\t" + (v.special ? "1" : "0") + "\t" + v.label +
+                "\t" + (pikmin::planter::step_allowed(steps, v.required) ? "1" : "0") + "\n";
     out += "end\t" + std::to_string(s.seeds.size()) + "\n";
     atomic_file(snapshot_path, out);
 }
@@ -347,13 +360,16 @@ void tick() {
         }
     }
     if (current_mode == "auto") {
+        const unsigned steps = selected_steps();
+        if (!steps) { status("no-seed-types-selected"); return; }
         std::set<std::string> in_slots;
         for (const auto &slot : s.slots) if (!slot.seed.empty()) in_slots.insert(slot.seed);
         for (const Slot &slot : s.slots) {
             if (!slot.seed.empty() || !pikmin::planter::permanent_slot(slot.type, slot.index, s.max_slots)) continue;
             const Seed *best{};
             for (const auto &[id, seed] : s.seeds)
-                if (pikmin::planter::can_plant(seed.planted, in_slots.count(id), seed.starred,
+                if (pikmin::planter::step_allowed(steps, seed.required) &&
+                        pikmin::planter::can_plant(seed.planted, in_slots.count(id), seed.starred,
                         seed.required, seed.special, seed.point) &&
                         (!best || seed.required < best->required || (seed.required == best->required && id < best->id))) best = &seed;
             if (best) { start("plant", *best, slot, s); return; }
