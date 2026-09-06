@@ -1,6 +1,17 @@
 # 一般附近派遣：定位同步與 120 秒上限
 
-## 部署狀態（實機驗收前檢查點）
+## 最新實機進度：1.4.21 已載入，靜止單筆與 off 跳點觀察通過
+
+- 第二次重開後，目標仍192.168.50.202:5555 / 24095PCADG / Android14；game PID10976。19:56:00 hooks正常載入、19:56:31 `runtime fields verified=1`，未重現前次120秒loader逾時。module1.4.21/code55與SO `b3d8ee978390c220e6cc5b068816206294646e53a4be77ea57fbb6ef19850807`一致。
+- 新guard同PID、連續多次ready / 3個fix / epoch11，raw與processed約24.3568325,124.1660690。CLOCK_BOOTTIME freshness修正實機通過。
+- 靜止時僅一筆花苗在200m內（約18.4m）。附近短暫armed 16秒後自動恢復off/0644，未改種類fruit seed、未移動GPS。任務`EhZYc0w5VktJaFMtLWNwVTlwVEdhUUFR`：1788696036899 nearby-selection-settling，1隻／4580ms；1788696041971 nearby-pre-start-settled，1隻／4581ms、CanTryStart=1、power=1；下一毫秒start-requested，1788696042908 start-rpc-completed。跨tick間隔5072ms，沒有同tick立刻Start。
+- 返程領取紀錄1788696051010 batch-dispatched、1788696052125 batch-confirmed，內容seed:1、pikmin:1；後續候選列表已無該ID。這是原生選隊→Start→返程領取的單筆紀錄確認，不是僅RPC完成，也非使用者目視確認。
+- 單筆已領取後，維持off，以現有JoyStick TELEPORT service介面（不是CC UI操作）從原位置飛往既有花苗座標35.7042269,139.4021074，再返回原位置；沒有啟動批次／花田，兩者服務皆未運作。浮點目的地實際為35.7042274,139.4021149。
+- 真實逐秒觀察：1788696161450 raw已到目的地，processed仍在原位，gate=game-location-catching-up；之後processed依序27.1936812,127.9750805 → 30.0305300,131.7840919 → 32.8673787,135.5931034；1788696170524才到目的地並location-settling，1788696173535才ready。epoch11→20，追趕約9秒，再穩定約3秒。
+- 返程也出現3個中繼位置；1788696187686開始catching-up，1788696197791進入settling，1788696200833才ready，epoch20→30。最終已恢復原GPS附近24.3568325,124.1660690，game PID10976未變、附近off/0644、沒有額外Start。
+- **剩餘：armed狀態跨遠距離追趕時的端到端不誤派、到點多筆並行／不重複隊員及完整收回；批次／花田回歸與先前UI待辦仍保留。** off觀察證明guard判斷正確，但不能替代armed負向測試。本輪沒有改程式或產物，不需為本輪文件更新再重開。
+
+## 先前部署紀錄（以下保留時間順序，最新以上方為準）
 
 - **19:45 實機續驗後，最新候選為 Native `1.4.21 / 55`**：已編譯、7組原生policy與5處MethodInfo檢查通過，並由 Magisk 安裝到 `modules_update`，**仍須再次重開機才載入**。APK維持0.6.15，不必重装。
 - Control Center `0.6.15 / 32` 已同簽章覆蓋安裝。
