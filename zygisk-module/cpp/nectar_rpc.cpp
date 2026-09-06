@@ -5,6 +5,7 @@
 #include "managed_gc.h"
 #include "dispatch_safety.h"
 #include "return_policy.h"
+#include "planter_policy.h"
 
 #include <cinttypes>
 #include <cmath>
@@ -3199,6 +3200,8 @@ void maybe_dispatch_return_batch() {
                             return_discard_postcard());
     }
 }
+#include "planter_automation.inc"
+
 void maybe_return_tasks() {
     const long long current = now_ms();
     if (current - last_return_scheduler_ms < 1000) return;
@@ -3206,6 +3209,7 @@ void maybe_return_tasks() {
     dry_run_return_tasks();
     maybe_dispatch_one_return_task();
     maybe_dispatch_return_batch();
+    planter_engine::tick();
 }
 
 void hooked_map_update(void *self, void *method_info) {
@@ -3320,6 +3324,7 @@ void start(const char *game_data_dir) {
     string_new = reinterpret_cast<StringNew>(xdl_sym(handle, "il2cpp_string_new", nullptr));
     gchandle_new = reinterpret_cast<GcHandleNew>(xdl_sym(handle, "il2cpp_gchandle_new", nullptr));
     gchandle_free = reinterpret_cast<GcHandleFree>(xdl_sym(handle, "il2cpp_gchandle_free", nullptr));
+    planter_engine::configure(handle, game_data_dir);
     gc_write_barrier = reinterpret_cast<GcWriteBarrier>(xdl_sym(handle, "il2cpp_gc_wbarrier_set_field", nullptr));
     object_get_class = reinterpret_cast<ObjectGetClass>(xdl_sym(handle, "il2cpp_object_get_class", nullptr));
     object_get_virtual_method = reinterpret_cast<ObjectGetVirtualMethod>(xdl_sym(handle, "il2cpp_object_get_virtual_method", nullptr));
