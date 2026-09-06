@@ -1,4 +1,6 @@
-# native1.4.14/code48: carried-resource return extension (live acceptance pending)
+# native1.4.15/code49: carried-resource return extension (live acceptance pending)
+
+Latest correction: loaded PID11046's fresh27-task v1 snapshot showed walking/mushroom Carry resources use requirement0/finish0, so1.4.14's NONE1-only hypothesis was disproven and no test claim was sent. The v152 garden Carry branch (PikminTasksController.OnPikminTaskItemAdded0x5DF04D4, branch0x5DF07C4-0x5DF089C) creates collectable Carry groups without requiring1; ChallengeInfo distinguishes the mushroom collection sequence.1.4.15 narrowly accepts0 or1 only for explicit Carry+Resource, never missing getter(-1), other unknown enums, CALL_PREPARE_ACTION2, future finish or zero-time non-Carry.24 arm64 policy tests PASS. ZIP `4b587f55c44e2125f3d68a6bb669ddd7bda4738869d882e57165b2494b47e96b`, SO `a899e133e2c1e7d116f704ad752dbe91ca8c830e741ac34c35c973edcbab4c4f`. Installed and second reboot issued; active hash/new loaded snapshot and one mushroom + walking-pickup claims still require verification. Keep dry-run/off; details below preserve the historical1.4.14 hypothesis, not current acceptance. Backup `v1414-observed-requirement-zero.tsv` records exact live evidence.
 
 User requested automatic collection of walking pickups and mushroom rewards still visible in the garden. Batch/farm efficiency work is paused separately. Old all-mode logs showed task count26, preparerReady0, finishDue0 while fruits were visible; actual new snapshot evidence is still required to confirm each task's state.
 
