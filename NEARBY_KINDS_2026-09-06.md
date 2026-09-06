@@ -1,5 +1,7 @@
 # native 1.4.19：附近派遣種類篩選
 
+2026-09-06補驗：Android14、game PID25787，先使用CC0.6.12的真實Gateway寫入0644控制檔，原生依序確認mask0/4/1/2/3，全部通過；測試期間dispatch off。返程UI默认水果＋花苗、禮物不勾已確認。候選0筆，所以這是設定串接證據，不是各類實際派出驗收。完成後恢復原armed/all/auto、nearby fruit seed；native binary未更換。
+
 CC 0.6.12將附近200m開關移到返程頁，新增水果／花苗／禮物盒勾選。
 
 `/data/local/tmp/pikmin-nearby-kinds.txt`：空白分隔fruit/seed/gift，none=0，缺檔=fruit+seed(mask3)。未知、空白、超長、讀取錯誤失敗關閉，不預設全選。0644，CC使用tmp+rename寫入。
