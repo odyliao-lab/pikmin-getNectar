@@ -4,6 +4,7 @@
 #include "And64InlineHook.hpp"
 #include "managed_gc.h"
 #include "dispatch_safety.h"
+#include "nearby_policy.h"
 #include "return_policy.h"
 #include "planter_policy.h"
 
@@ -314,6 +315,8 @@ char dispatch_mode_path[512]{};
 // Optional restriction for armed mode. Missing/unknown means all existing
 // kinds remain eligible; the flower-farm controller explicitly writes farm.
 char dispatch_kinds_path[512]{};
+char nearby_kinds_path[512]{};
+char nearby_status_path[512]{};
 char dispatch_target_path[512]{};
 char dispatch_ready_path[512]{};
 char dispatch_history_path[512]{};
@@ -466,6 +469,7 @@ bool current_location(double &latitude, double &longitude);
 double distance_metres(double lat1, double lng1, double lat2, double lng2);
 std::string read_dispatch_mode();
 std::string read_dispatch_kind_filter();
+unsigned read_nearby_selection();
 std::string read_planting_control_mode();
 bool flower_farm_session_active();
 std::string read_dispatch_target();
@@ -1019,6 +1023,15 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     const bool armed = dispatch_mode == "armed";
     const bool batch = dispatch_mode == "batch";
     const std::string armed_kind_filter = armed ? read_dispatch_kind_filter() : "all";
+    const unsigned nearby_mask = read_nearby_selection();
+    const std::string nearby_tmp = std::string(nearby_status_path) + ".tmp";
+    if (FILE *ack = std::fopen(nearby_tmp.c_str(), "w")) {
+        std::fprintf(ack, "v1\t%lld\t%d\t%u\t%s\t%s\n", now_ms(), getpid(),
+                     nearby_mask, dispatch_mode.c_str(), armed_kind_filter.c_str());
+        const bool ok = std::fclose(ack) == 0;
+        if (ok && chmod(nearby_tmp.c_str(), 0644) == 0)
+            std::rename(nearby_tmp.c_str(), nearby_status_path);
+    }
     // A controller stop is an explicit safety release.  Do not let a failed
     // or timed-out prior batch leave an in-memory confirmation lock that
     // blocks every later, independently armed batch.
@@ -1207,8 +1220,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         // live scan. Batch mode is stricter: the Control Center must name this
         // exact task and prove a fresh arrival gate before any game
         // API is invoked. The native side rechecks the live game location.
-        const bool armed_kind_allowed = armed_kind_filter == "all" || armed_kind_filter == kind ||
-                (armed_kind_filter == "farm" && (std::strcmp(kind, "fruit") == 0 || std::strcmp(kind, "seed") == 0));
+        const bool armed_kind_allowed = pikmin::nearby_kind_allowed(armed_kind_filter, nearby_mask, kind);
         const bool requested = (armed && armed_kind_allowed) || (batch_ready && id_text == batch_target);
         // Control Center's own arrival gate already requires this same
         // distance column within 4 m (agreeing with the provider) for two
@@ -2960,6 +2972,16 @@ std::string read_dispatch_kind_filter() {
     return (result == "seed" || result == "fruit" || result == "gift" || result == "farm") ? result : "all";
 }
 
+unsigned read_nearby_selection() {
+    FILE *file = std::fopen(nearby_kinds_path, "r");
+    if (!file) return errno == ENOENT ? 3 : 0;
+    char value[130]{};
+    const size_t size = std::fread(value, 1, sizeof(value), file);
+    const bool failed = std::ferror(file);
+    std::fclose(file);
+    return failed ? 0 : pikmin::nearby_selection(std::string(value, size));
+}
+
 std::string read_dispatch_target() {
     FILE *file = std::fopen(dispatch_target_path, "r");
     if (!file) return {};
@@ -3356,6 +3378,8 @@ void start(const char *game_data_dir) {
     std::snprintf(dispatch_status_path, sizeof(dispatch_status_path), "%s/files/dispatch_probe_status.tsv", game_data_dir);
     std::snprintf(dispatch_mode_path, sizeof(dispatch_mode_path), "/data/local/tmp/pikmin-dispatch-mode.txt");
     std::snprintf(dispatch_kinds_path, sizeof(dispatch_kinds_path), "/data/local/tmp/pikmin-dispatch-kinds.txt");
+    std::snprintf(nearby_kinds_path, sizeof(nearby_kinds_path), "/data/local/tmp/pikmin-nearby-kinds.txt");
+    std::snprintf(nearby_status_path, sizeof(nearby_status_path), "%s/files/nearby_dispatch_status.tsv", game_data_dir);
     std::snprintf(dispatch_target_path, sizeof(dispatch_target_path), "/data/local/tmp/pikmin-dispatch-target.txt");
     std::snprintf(dispatch_ready_path, sizeof(dispatch_ready_path), "/data/local/tmp/pikmin-dispatch-ready.tsv");
     std::snprintf(dispatch_history_path, sizeof(dispatch_history_path), "%s/files/dispatch_history.tsv", game_data_dir);
