@@ -3,6 +3,14 @@
 #include <iostream>
 int main() {
     using namespace pikmin;
+    for(double distance : {0., 199., 200., 201., 500., 10000.}) assert(dispatch_distance_allowed(true,false,distance));
+    assert(!dispatch_distance_allowed(true,false,-1));
+    assert(!dispatch_distance_allowed(true,false,NAN));
+    assert(!dispatch_distance_allowed(true,false,INFINITY));
+    assert(dispatch_distance_allowed(false,false,200));
+    assert(!dispatch_distance_allowed(false,false,200.1)); // farm unchanged
+    assert(dispatch_distance_allowed(false,true,4));
+    assert(!dispatch_distance_allowed(false,true,4.1)); // batch unchanged
     assert(nearby_selection("fruit seed") == 3);
     assert(nearby_selection("gift") == 4);
     assert(nearby_selection("gift fruit seed") == 7);

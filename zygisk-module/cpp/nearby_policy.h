@@ -1,8 +1,13 @@
 #pragma once
+#include <cmath>
 #include <sstream>
 #include <string>
 
 namespace pikmin {
+// Ordinary armed has no radius cap. Farm and named batch retain their old gates.
+inline bool dispatch_distance_allowed(bool nearby, bool batch, double metres) {
+    return std::isfinite(metres) && metres >= 0 && (nearby || metres <= (batch ? 4.0 : 200.0));
+}
 // Separate from the legacy farm/batch filter. Missing config = fruit + seed.
 inline unsigned nearby_selection(const std::string &value) {
     if (value.size() > 128) return 0;

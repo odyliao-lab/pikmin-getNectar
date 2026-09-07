@@ -1,5 +1,7 @@
 # pikmin-getNectar
 
+最新開發1.4.23/code57：一般armed取消200m半徑，只保留原生往返5分鐘及既有定位／隊員安全保護；farm200m、batch4m/2秒不變。7組arm64政策與5處MethodInfo檢查通過，已排入待載入模組，尚待重開及>200m真實派遣。guard v2需CC0.8.2+。完整回退和證據見Control Center的HANDOFF_2026-09-08_TIME_ONLY.md；下方1.4.22及更早規則為歷史。
+
 在已 root、啟用 Magisk Zygisk 的 Android 手機上，透過 Pikmin Bloom 的 IL2CPP 原生 API 提供本機自動化能力。它不使用螢幕手勢或畫面座標點擊。
 
 目前 module 提供四個彼此獨立的控制面：

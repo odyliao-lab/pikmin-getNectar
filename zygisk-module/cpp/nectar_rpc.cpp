@@ -1299,8 +1299,8 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         // Only trustworthy since current_location() now fails closed on a
         // stale fallback file (see kSystemGpsMaxAgeSeconds); at the old 25 m
         // this same reading was once 111 m wrong for over an hour.
-        // Ordinary nearby requires BOTH processed-game 200m radius and
-        // selected-team <=300s duration, on a later live inventory update.
+        // Ordinary armed: selected-team <=300s on a later live update, no radius cap.
+        // Keep a valid processed-game distance, and retain farm/batch distance gates.
         const double allowed_distance = batch ? 4.0 : 200.0;
         const bool armed_capacity_available = armed &&
                 !dispatch_reservations.has_sent(id_text) &&
@@ -1326,7 +1326,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                 const bool safe = requested && can_start && power && same_team && !gift_pikmin_unavailable
                         && pikmin::nearby_duration_safe(live_duration) && start_expedition
                         && nearby_location_gate.ready(steady_ms()) && selection.location_epoch == nearby_location_gate.epoch()
-                        && live_distance >= 0 && live_distance <= 200 && read_dispatch_mode() == "armed"
+                        && pikmin::dispatch_distance_allowed(true, false, live_distance) && read_dispatch_mode() == "armed"
                         && read_dispatch_kind_filter() == armed_kind_filter
                         && pikmin::nearby_kind_allowed(armed_kind_filter, read_nearby_selection(), kind)
                         && starts_requested < static_cast<int>(kArmedMaxStartsPerScan)
@@ -1407,7 +1407,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
             }
         } else if ((armed_capacity_available || batch_capacity_available) && requested && data && picked &&
             picked_count > 0 && set_expedition_pikmins &&
-            distance >= 0.0 && distance <= allowed_distance) {
+            pikmin::dispatch_distance_allowed(nearby, batch, distance)) {
             // Gifts reach the picker only after designated-ID and native
             // Allows checks. Never substitute an unrelated idle Pikmin.
             std::string selected_ids;
@@ -2611,7 +2611,7 @@ void update_nearby_location(long long wall) {
     nearby_location_gate.observe(nearby_fix, nearby_elapsed_ms(), steady_ms());
     const std::string temp = std::string(nearby_gate_status_path) + ".tmp";
     if (FILE *file = std::fopen(temp.c_str(), "w")) {
-        std::fprintf(file, "v1\t%lld\t%d\t%s\t%llu\t%u\t%.7f\t%.7f\t%.7f\t%.7f\t%lld\t%lld\n",
+        std::fprintf(file, "v2\t%lld\t%d\t%s\t%llu\t%u\t%.7f\t%.7f\t%.7f\t%.7f\t%lld\t%lld\n",
                 wall, getpid(), nearby_location_gate.reason(), static_cast<unsigned long long>(nearby_location_gate.epoch()),
                 nearby_location_gate.samples(), nearby_fix.raw_lat, nearby_fix.raw_lng,
                 nearby_fix.game_lat, nearby_fix.game_lng, static_cast<long long>(nearby_fix.raw_wall_ms),
