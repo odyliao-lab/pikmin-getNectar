@@ -1,5 +1,7 @@
 # pikmin-getNectar
 
+最新開發 **1.4.24/code58** 配合Control Center0.9.1：新增育苗手動恢復協定，同PID／90秒有效期／確切pending綁定，兩次完整庫存核對後封存舊pending才解除暫停。恢復不呼叫遊戲RPC，結果不明不放行。原5分鐘不限距離與批次／花田規則保留。本機靜態檢查與編譯完成，native policy裝置執行及真正pending恢复仍待驗證，尚未安裝。[育苗介面](PLANTER_2026-09-06.md)。
+
 最新開發1.4.23/code57：一般armed取消200m半徑，只保留原生往返5分鐘及既有定位／隊員安全保護；farm200m、batch4m/2秒不變。7組arm64政策與5處MethodInfo檢查通過，已排入待載入模組，尚待重開及>200m真實派遣。guard v2需CC0.8.2+。完整回退和證據見Control Center的HANDOFF_2026-09-08_TIME_ONLY.md；下方1.4.22及更早規則為歷史。
 
 在已 root、啟用 Magisk Zygisk 的 Android 手機上，透過 Pikmin Bloom 的 IL2CPP 原生 API 提供本機自動化能力。它不使用螢幕手勢或畫面座標點擊。

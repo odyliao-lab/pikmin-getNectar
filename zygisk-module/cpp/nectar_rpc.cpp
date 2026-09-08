@@ -8,6 +8,7 @@
 #include "nearby_safety.h"
 #include "return_policy.h"
 #include "planter_policy.h"
+#include "planter_recovery.h"
 
 #include <cinttypes>
 #include <cmath>

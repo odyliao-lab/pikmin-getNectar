@@ -335,6 +335,7 @@ void start(const std::string &action, const Seed &seed, const Slot &slot, const 
     if (!pending.root) { blocked = "task-root-failed"; pending.task = nullptr; status(blocked); return; }
     status(action + "-sent", seed.id);
 }
+#include "planter_recovery.inc"
 void tick() {
     if (!runtime_metadata_ready || !return_inventory_manager || !rpc_manager || now_ms() - last_tick < 5000) return;
     last_tick = now_ms();
@@ -342,6 +343,8 @@ void tick() {
     if (!compatible) { status("metadata-unavailable"); return; }
     Snapshot s = capture();
     write_snapshot(s);
+    recover(s);
+    if (recovery_waiting) { status("manual-recovery-checking"); return; }
     if (restart_blocked) { status("restart-pending-review-required"); return; }
     if (!blocked.empty()) { status(blocked); return; }
     if (pending.task) { observe_pending(s); return; }
@@ -387,5 +390,6 @@ void configure(void *handle, const char *game_data_dir) {
     std::snprintf(state_path, sizeof(state_path), "%s/files/planter_status.tsv", game_data_dir);
     std::snprintf(history_path, sizeof(history_path), "%s/files/planter_history.tsv", game_data_dir);
     std::snprintf(pending_path, sizeof(pending_path), "%s/files/planter_pending.tsv", game_data_dir);
+    std::snprintf(recovery_state_path, sizeof(recovery_state_path), "%s/files/planter_recovery.tsv", game_data_dir);
 }
 } // namespace planter_engine
