@@ -1,5 +1,13 @@
 # pikmin-getNectar
 
+2026-09-11 本機 **1.4.29/code63**：新增`core_runtime.tsv`每秒同PID版本回報，供Control Center0.11.1/code56內附配對核心更新及重開核對。原1.4.28散步修正保留；餵食仍唯讀探查。模組編譯與MethodInfo／probe靜態檢查通過，未安裝／發布，實際載入待驗。完整流程見相鄰Control Center的 `HANDOFF_2026-09-11_CORE_UPDATE.md`。
+
+2026-09-11 本機 **1.4.28/code62**：一般armed支援18km/h連續定位，候選每秒檢查、選隊至少隔1秒重驗；保留8m原始／遊戲定位一致性與5分鐘原生上限。批次／花田頻率不變。靜態檢查及模組編譯完成，policy執行與手機驗收尚未進行，未安裝／發布。[移動派遣交接](NEARBY_WALKING_2026-09-11.md)。
+
+2026-09-10 本機 **1.4.27/code61**：加入獨立opt-in `feeding_probe.inc` 精華庫存唯讀探查，永遠observe-only，沒有餵食／收瓣RPC。配合Control Center0.11.0前置介面；尚未安裝／重開／實機核對，不是可用的自動餵食版本。開發邊界、協定與後續工作見相鄰Control Center repo的 `HANDOFF_2026-09-10_FEEDING.md`。1.4.26既有未提交改動保留，不屬於本次新增餵食功能。
+
+最新開發 **1.4.26/code60**：配合Control Center0.10.5，批次水果／花苗距離上限100m，禮物仍4m，實際選定隊伍原生往返仍須>0且<=2000ms、CanStart及隊員重驗不變。新增唯讀`batch_area_capability.tsv`同PID／12秒能力回報，APK無新鮮回報時保持4m相容路徑。一般armed5分鐘與花田規則不變。8組裝置policy／MethodInfo靜態與建置通過；已排入指定Android14手機Magisk，**待重開載入及相近任務驗收**，未公開發布。回退備份與完整協定位於Control Center `HANDOFF_2026-09-09_AUTOMATION_PHASE1.md` 的0.10.5段落。
+
 最新開發 **1.4.25/code59**：供Control Center新手機部署首版使用，service在沒有既有模式檔時預設nectar／return皆off，不再預設auto。已有模式檔不覆寫；C++操作規則不變。五處MethodInfo靜態檢查、重新建置與四項隔離host shell預設／保留值測試通過；尚未安裝／重開或Android真機驗收。需要新模組重開才使用此服務版本。
 
 最新開發 **1.4.24/code58** 配合Control Center0.9.1：新增育苗手動恢復協定，同PID／90秒有效期／確切pending綁定，兩次完整庫存核對後封存舊pending才解除暫停。恢復不呼叫遊戲RPC，結果不明不放行。原5分鐘不限距離與批次／花田規則保留。本機靜態檢查與編譯完成，native policy裝置執行及真正pending恢复仍待驗證，尚未安裝。[育苗介面](PLANTER_2026-09-06.md)。

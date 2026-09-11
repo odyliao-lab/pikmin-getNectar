@@ -55,5 +55,40 @@ int main() {
     boot.observe(actual,-1,703002); assert(!boot.ready(703002));
     boot.observe(actual,1788695172167LL,703003); assert(!boot.ready(703003));
     boot.observe(actual,700000,703004); assert(!boot.ready(703004)); // wrong clock/future
-    puts("PASS nearby safety: 300s inclusive boundary, 300001ms rejected, 144h failures, staged teleport, stale/future fixes, real boot-time sample and suspend");
+    // 18km/h continuous route: no repeated epoch resets after passing 8m.
+    NearbyLocationGate walking;
+    NearbyFix walk{true,0,0,0,0,1000};
+    for (int i=0;i<120;++i) {
+        walk.raw_wall_ms=1000+i*1000;
+        walk.raw_lat=walk.game_lat=i*5.0/111194.9266;
+        walking.observe(walk,walk.raw_wall_ms,walk.raw_wall_ms);
+        if(i>=3) assert(walking.ready(walk.raw_wall_ms));
+        assert(walking.epoch()==0);
+    }
+    // A loop corner/reversal is valid: do not require a fixed heading.
+    for(int i=1;i<=10;++i) {
+        walk.raw_wall_ms+=1000; walk.raw_lat=walk.game_lat=(119-i)*5.0/111194.9266;
+        walking.observe(walk,walk.raw_wall_ms,walk.raw_wall_ms);
+        assert(walking.ready(walk.raw_wall_ms));
+    }
+    epoch=walking.epoch();
+    walk.raw_wall_ms+=1000; walk.raw_lat=walk.game_lat=10;
+    walking.observe(walk,walk.raw_wall_ms,walk.raw_wall_ms);
+    assert(!walking.ready(walk.raw_wall_ms)&&walking.epoch()!=epoch);
+    // Continual overspeed cannot re-arm even when raw and processed agree.
+    for(int i=1;i<=8;++i) {
+        walk.raw_wall_ms+=1000; walk.raw_lat=walk.game_lat=10+i*30.0/111194.9266;
+        walking.observe(walk,walk.raw_wall_ms,walk.raw_wall_ms);
+        assert(!walking.ready(walk.raw_wall_ms));
+    }
+    // Duplicate timestamps cannot hide raw jumps or count toward readiness.
+    epoch=walking.epoch(); walk.raw_lat=walk.game_lat=11;
+    walking.observe(walk,walk.raw_wall_ms,walk.raw_wall_ms+1);
+    assert(!walking.ready(walk.raw_wall_ms+1)&&walking.epoch()!=epoch);
+    // Lag over 8m remains blocked; moving support is NOT extra lag allowance.
+    walk.raw_wall_ms+=1000; walk.game_lat=walk.raw_lat-20.0/111194.9266;
+    walking.observe(walk,walk.raw_wall_ms,walk.raw_wall_ms);
+    assert(!walking.ready(walk.raw_wall_ms));
+    assert(std::string(walking.reason())=="game-location-catching-up");
+    puts("PASS nearby safety: duration limits, 18km/h continuous route/reversal, overspeed, full/staged jumps, duplicate/stale/future fixes and suspend");
 }

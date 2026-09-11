@@ -24,7 +24,7 @@ inline double nearby_metres(double a, double b, double c, double d) {
  * Re-reading one fix never counts as several fresh location updates. */
 class NearbyLocationGate {
     bool anchored_{};
-    double anchor_lat_{}, anchor_lng_{};
+    double anchor_lat_{}, anchor_lng_{}, raw_lat_{}, raw_lng_{};
     int64_t since_{}, last_seen_{}, last_fix_{}, last_elapsed_{};
     unsigned samples_{};
     uint64_t epoch_{};
@@ -49,14 +49,25 @@ public:
         if (nearby_metres(f.raw_lat, f.raw_lng, f.game_lat, f.game_lng) > 8.0) {
             reset("game-location-catching-up"); return;
         }
-        if (anchored_ && (f.raw_wall_ms < last_fix_ ||
-                nearby_metres(anchor_lat_, anchor_lng_, f.game_lat, f.game_lng) > 8.0))
-            reset("location-moving");
+        // Follow consecutive fixes instead of requiring the player to remain
+        // inside an 8m circle. 18km/h = 5m/s. Allow 7m/s plus 2m jitter,
+        // but retain the independent raw/processed 8m agreement above.
+        if (anchored_) {
+            const int64_t dt = f.raw_wall_ms-last_fix_;
+            const double raw_step = nearby_metres(raw_lat_, raw_lng_, f.raw_lat, f.raw_lng);
+            const double game_step = nearby_metres(anchor_lat_, anchor_lng_, f.game_lat, f.game_lng);
+            if (dt < 0 || dt > 5000 || (dt == 0 && raw_step > 0.5) ||
+                    (dt > 0 && (raw_step > 7.0*dt/1000.0+2.0 || game_step > 7.0*dt/1000.0+2.0)))
+                reset("location-moving");
+        }
         if (!anchored_) {
             anchored_ = true; anchor_lat_ = f.game_lat; anchor_lng_ = f.game_lng;
             since_ = steady; samples_ = 1; last_fix_ = f.raw_wall_ms;
+            raw_lat_ = f.raw_lat; raw_lng_ = f.raw_lng;
         } else if (f.raw_wall_ms > last_fix_) {
             last_fix_ = f.raw_wall_ms; if (samples_ < 3) ++samples_;
+            anchor_lat_ = f.game_lat; anchor_lng_ = f.game_lng;
+            raw_lat_ = f.raw_lat; raw_lng_ = f.raw_lng;
         }
         reason_ = samples_ >= 3 && steady-since_ >= 3000 ? "ready" : "location-settling";
     }

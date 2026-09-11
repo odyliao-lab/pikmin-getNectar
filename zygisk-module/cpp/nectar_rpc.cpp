@@ -318,6 +318,7 @@ char return_status_path[512]{};
 char return_candidates_path[512]{};
 char return_batch_limit_path[512]{};
 char compatibility_path[512]{};
+char core_runtime_path[512]{};
 char dispatch_candidates_path[512]{};
 char dispatch_availability_path[512]{};
 char dispatch_status_path[512]{};
@@ -375,6 +376,7 @@ std::string dispatch_last_gift_skip_id;
 // after SetPikmins(); instead, remember the exact target and re-check it on a
 // later live inventory tick before StartExpeditionAsync().
 constexpr long long kBatchSelectionSettleMs = 1500;
+constexpr long long kNearbySelectionSettleMs = 1000;
 std::string batch_selection_settling_id;
 std::string batch_selection_settling_kind;
 long long batch_selection_settling_started_ms{};
@@ -1072,6 +1074,17 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     FILE *file = std::fopen(dispatch_candidates_path, "w");
     if (!file) return;
     std::string availability_rows;
+    // Read-only capability tied to this live process and projection, not module.prop.
+    const std::string candidates_file(dispatch_candidates_path);
+    const std::string area_path = candidates_file.substr(0, candidates_file.find_last_of('/') + 1)
+            + "batch_area_capability.tsv";
+    const std::string area_tmp = area_path + ".tmp";
+    if (FILE *ack = std::fopen(area_tmp.c_str(), "w")) {
+        const bool written = std::fprintf(ack, "v1\t%lld\t%d\t100\t2000\tend\n", now_ms(), getpid()) > 0;
+        const bool closed = std::fclose(ack) == 0;
+        if (written && closed && chmod(area_tmp.c_str(), 0644) == 0)
+            std::rename(area_tmp.c_str(), area_path.c_str());
+    }
     int availability_count{};
     double current_latitude{}, current_longitude{};
     const bool has_current_location = current_location(current_latitude, current_longitude);
@@ -1302,7 +1315,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         // this same reading was once 111 m wrong for over an hour.
         // Ordinary armed: selected-team <=300s on a later live update, no radius cap.
         // Keep a valid processed-game distance, and retain farm/batch distance gates.
-        const double allowed_distance = batch ? 4.0 : 200.0;
+        const double allowed_distance = batch ? (std::strcmp(kind, "gift") == 0 ? 4.0 : 100.0) : 200.0;
         const bool armed_capacity_available = armed &&
                 !dispatch_reservations.has_sent(id_text) &&
                 armed_dispatches.size() < kArmedMaxInFlight &&
@@ -1314,7 +1327,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
         auto nearby_pending = nearby_selections.find(id_text);
         if (nearby && nearby_pending != nearby_selections.end()) {
             const auto selection = nearby_pending->second;
-            if (steady_ms()-selection.since >= kBatchSelectionSettleMs) {
+            if (steady_ms()-selection.since >= kNearbySelectionSettleMs) {
                 const int64_t live_duration = data && original_get_expedition_total_duration_ms
                         ? original_get_expedition_total_duration_ms(data, nullptr) : 0;
                 const bool same_team = data && team_is_eligible(selection.team, eligible_ids)
@@ -1408,7 +1421,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
             }
         } else if ((armed_capacity_available || batch_capacity_available) && requested && data && picked &&
             picked_count > 0 && set_expedition_pikmins &&
-            pikmin::dispatch_distance_allowed(nearby, batch, distance)) {
+            pikmin::dispatch_distance_allowed(nearby, batch, distance) && (!batch || distance <= allowed_distance)) {
             // Gifts reach the picker only after designated-ID and native
             // Allows checks. Never substitute an unrelated idle Pikmin.
             std::string selected_ids;
@@ -1749,8 +1762,13 @@ void write_return_candidates(void *items, int count, long long now) {
 
 void dry_run_return_tasks() {
     const long long now = now_ms();
-    if (now - last_return_dry_run_ms < 5000) return;
-    last_return_dry_run_ms = now;
+    static long long last_dispatch_scan_ms{};
+    const bool walking = read_dispatch_mode() == "armed" && read_dispatch_kind_filter() != "farm";
+    const bool dispatch_due = now-last_dispatch_scan_ms >= (walking ? 1000 : 5000);
+    const bool return_due = now-last_return_dry_run_ms >= 5000;
+    if (!dispatch_due && !return_due) return;
+    if (dispatch_due) last_dispatch_scan_ms = now;
+    if (return_due) last_return_dry_run_ms = now;
     if (!return_preparer || !return_inventory_manager || !original_get_pikmin_task_list ||
         !original_should_prepare_completion || !get_inventory_item_id) {
         LOGI("[RETURN-DIAG] dry-run waiting preparer=%p inventory=%p taskList=%p shouldPrepare=%p getId=%p",
@@ -1765,7 +1783,8 @@ void dry_run_return_tasks() {
         LOGI("[RETURN-DIAG] dry-run task-list null inventory=%p", return_inventory_manager);
         return;
     }
-    write_dispatch_candidates(list, now);
+    if (dispatch_due) write_dispatch_candidates(list, now);
+    if (!return_due) return; // Keep return diagnostics at their original cadence.
     void *items = *reinterpret_cast<void **>(static_cast<uint8_t *>(list) + 0x10);
     const int count = *reinterpret_cast<int *>(static_cast<uint8_t *>(list) + 0x18);
     if (!items || count < 0 || count > kMaxPikminTaskListCount) {
@@ -2926,6 +2945,12 @@ void maybe_claim() {
     const long long current = now_ms();
     if (current - last_tick_ms < 1000) return;
     last_tick_ms = current;
+    if (FILE *runtime = std::fopen((std::string(core_runtime_path)+".tmp").c_str(), "w")) {
+        const bool written = std::fprintf(runtime, "v1\t%lld\t%d\t1.4.29\t63\t152.0\n", current, getpid()) > 0;
+        const bool closed = std::fclose(runtime) == 0;
+        const std::string tmp = std::string(core_runtime_path)+".tmp";
+        if (written && closed && chmod(tmp.c_str(),0644)==0) std::rename(tmp.c_str(),core_runtime_path);
+    }
     update_nearby_location(current);
     const std::string mode = read_mode();
     poll_pending_task();
@@ -3382,6 +3407,7 @@ void maybe_dispatch_return_batch() {
     }
 }
 #include "planter_automation.inc"
+#include "feeding_probe.inc"
 
 void maybe_return_tasks() {
     const long long current = now_ms();
@@ -3391,6 +3417,7 @@ void maybe_return_tasks() {
     maybe_dispatch_one_return_task();
     maybe_dispatch_return_batch();
     planter_engine::tick();
+    feeding_probe::tick();
 }
 
 void hooked_map_update(void *self, void *method_info) {
@@ -3510,6 +3537,7 @@ void start(const char *game_data_dir) {
     gchandle_new = reinterpret_cast<GcHandleNew>(xdl_sym(handle, "il2cpp_gchandle_new", nullptr));
     gchandle_free = reinterpret_cast<GcHandleFree>(xdl_sym(handle, "il2cpp_gchandle_free", nullptr));
     planter_engine::configure(handle, game_data_dir);
+    feeding_probe::configure(handle, game_data_dir);
     gc_write_barrier = reinterpret_cast<GcWriteBarrier>(xdl_sym(handle, "il2cpp_gc_wbarrier_set_field", nullptr));
     object_get_class = reinterpret_cast<ObjectGetClass>(xdl_sym(handle, "il2cpp_object_get_class", nullptr));
     object_get_virtual_method = reinterpret_cast<ObjectGetVirtualMethod>(xdl_sym(handle, "il2cpp_object_get_virtual_method", nullptr));
@@ -3536,6 +3564,7 @@ void start(const char *game_data_dir) {
     std::snprintf(return_candidates_path, sizeof(return_candidates_path), "%s/files/return_candidates.tsv", game_data_dir);
     std::snprintf(return_batch_limit_path, sizeof(return_batch_limit_path), "/data/local/tmp/pikmin-return-batch-limit.txt");
     std::snprintf(compatibility_path, sizeof(compatibility_path), "%s/files/compatibility_status.tsv", game_data_dir);
+    std::snprintf(core_runtime_path, sizeof(core_runtime_path), "%s/files/core_runtime.tsv", game_data_dir);
     std::snprintf(dispatch_candidates_path, sizeof(dispatch_candidates_path), "%s/files/dispatch_candidates.tsv", game_data_dir);
     std::snprintf(dispatch_availability_path, sizeof(dispatch_availability_path), "%s/files/dispatch_availability.tsv", game_data_dir);
     std::snprintf(dispatch_status_path, sizeof(dispatch_status_path), "%s/files/dispatch_probe_status.tsv", game_data_dir);
