@@ -1,5 +1,13 @@
 # pikmin-getNectar
 
+2026-09-12 1.4.33/code67隨Control Center0.12.7/code65交付：重開後實際載入及種花reason13收集按鈕呼叫／提示消失已驗；沿路49點的5果1苗派遣及領取亦有原生證據。跨帳號、失聯及多輪耐久仍待補驗。下方「待重開」為開發當時紀錄。
+
+2026-09-12 開發版1.4.33/code67：新增種花獎勵視窗處理（GotItemOverlay reason13）。僅在return=all或本核心停花後60秒內授權，等待collectButton可操作且非loading，再走原生InvokeClick；其他獎勵不操作，60秒逾時／例外不重送，跨frame物件使用有界GC root。11組隔離native測試（新視窗測試為mock runtime）及建置通過，實際關閉仍待新核心重開驗證。配套APK0.12.7/code65，未發布。
+
+2026-09-11 開發版1.4.31/code65：補登入／登出帳號雜湊回報，v2路線租約綁定帳號並撤銷登出前token。原生閒置證據尚缺，session維持busy，不開放跨程序接續。10組隔離policy及編譯通過，登入時序／切帳／沿路採果仍待真機驗證；配套Control Center0.12.1/code59，詳相鄰repo的HANDOFF_2026-09-11_SESSION_IDENTITY.md。未發布。
+
+2026-09-11 **1.4.30/code64 沿路開發版**：新增獨立route租約／延遲軌跡門檻及本次工作明確授權的停花／結算回報，既有armed與batch/farm條件保留。9組隔離Android policy、MethodInfo靜態及模組建置通過；已排入192.168.50.202 Magisk，待重開載入，未公開發布、未完成新模式花田驗收。配套APK0.12.0/code58。協定、備份與待驗項目見相鄰控制中心 `HANDOFF_2026-09-11_ROUTE_HARVEST.md`；不要將後續的歷史版本快照當作現況。
+
 2026-09-11 本機 **1.4.29/code63**：新增`core_runtime.tsv`每秒同PID版本回報，供Control Center0.11.1/code56內附配對核心更新及重開核對。原1.4.28散步修正保留；餵食仍唯讀探查。模組編譯與MethodInfo／probe靜態檢查通過，未安裝／發布，實際載入待驗。完整流程見相鄰Control Center的 `HANDOFF_2026-09-11_CORE_UPDATE.md`。
 
 2026-09-11 本機 **1.4.28/code62**：一般armed支援18km/h連續定位，候選每秒檢查、選隊至少隔1秒重驗；保留8m原始／遊戲定位一致性與5分鐘原生上限。批次／花田頻率不變。靜態檢查及模組編譯完成，policy執行與手機驗收尚未進行，未安裝／發布。[移動派遣交接](NEARBY_WALKING_2026-09-11.md)。

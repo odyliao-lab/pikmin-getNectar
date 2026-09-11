@@ -6,6 +6,10 @@
 #include "dispatch_safety.h"
 #include "nearby_policy.h"
 #include "nearby_safety.h"
+#include "route_policy.h"
+#include "session_identity.h"
+#include <mutex>
+#include <set>
 #include "return_policy.h"
 #include "planter_policy.h"
 #include "planter_recovery.h"
@@ -330,6 +334,12 @@ char nearby_kinds_path[512]{};
 char nearby_status_path[512]{};
 char nearby_gate_status_path[512]{};
 pikmin::NearbyLocationGate nearby_location_gate;
+pikmin::RouteLocationGate route_location_gate;
+char route_status_path[512]{};
+std::string route_gate_token, route_stop_token;
+bool route_stop_started{}, route_session_owned{};
+void *route_close_task{};
+GcHandle route_close_handle{};
 pikmin::NearbyFix nearby_fix;
 struct NearbySelection {
     std::string kind;
@@ -487,6 +497,46 @@ std::string last_result = "none";
 
 long long now_ms();
 long long steady_ms();
+long long nearby_elapsed_ms();
+std::mutex identity_mutex;
+std::string identity_hash;
+std::set<std::string> revoked_route_tokens;
+bool identity_logout_hook_ready{};
+char identity_path[512]{};
+using LoggedOut = void (*)(void *, void *);
+LoggedOut original_logged_out{};
+pikmin::RouteLease raw_route_lease() {
+    char raw[202]{}; FILE *f=std::fopen("/data/local/tmp/pikmin-route-lease.tsv","r");
+    if(!f)return {};size_t n=std::fread(raw,1,201,f);std::fclose(f);
+    return pikmin::RouteLease::parse(std::string(raw,n),getpid(),now_ms());
+}
+pikmin::RouteLease route_lease() {
+    auto lease=raw_route_lease();
+    std::lock_guard<std::mutex> lock(identity_mutex);
+    return identity_logout_hook_ready&&!identity_hash.empty()&&lease.account==identity_hash&&!revoked_route_tokens.count(lease.token)?lease:pikmin::RouteLease{};
+}
+void write_identity(long long now) {
+    std::lock_guard<std::mutex> lock(identity_mutex);
+    if(!identity_path[0])return;
+    const bool ready=identity_logout_hook_ready&&!identity_hash.empty();
+    const std::string tmp=std::string(identity_path)+".tmp";
+    if(FILE *f=std::fopen(tmp.c_str(),"w")){
+        // Busy is conservative: this producer does not certify all outstanding RPCs idle.
+        bool ok=std::fprintf(f,"v1\t%lld\t%d\t%s\t%s\tbusy\tend\n",now,getpid(),ready?identity_hash.c_str():"-",ready?"ready":"unknown")>0;
+        bool closed=std::fclose(f)==0;if(ok&&closed&&chmod(tmp.c_str(),0644)==0)std::rename(tmp.c_str(),identity_path);
+    }
+}
+void invalidate_identity() {
+    auto lease=raw_route_lease();
+    {std::lock_guard<std::mutex> lock(identity_mutex);identity_hash.clear();if(lease.valid())revoked_route_tokens.insert(lease.token);}
+    write_identity(now_ms());
+}
+void hooked_logged_out(void *self,void *method) {
+    invalidate_identity(); // Before native logout can enter another account.
+    if(original_logged_out)original_logged_out(self,method);
+}
+bool dispatch_location_ready(bool route) {return route ? route_lease().phase=="walk"&&route_location_gate.ready(nearby_elapsed_ms()) : nearby_location_gate.ready(steady_ms());}
+uint64_t dispatch_location_epoch(bool route) {return route ? route_location_gate.epoch() : nearby_location_gate.epoch();}
 void update_nearby_location(long long wall);
 void *find_class(const char *namespaze, const char *name);
 void log_task_variant_metadata(void *proto);
@@ -1089,14 +1139,15 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
     double current_latitude{}, current_longitude{};
     const bool has_current_location = current_location(current_latitude, current_longitude);
     const std::string dispatch_mode = read_dispatch_mode();
-    const bool armed = dispatch_mode == "armed";
+    const bool route = dispatch_mode == "route";
+    const bool armed = dispatch_mode == "armed" || route;
     const bool batch = dispatch_mode == "batch";
-    const std::string armed_kind_filter = armed ? read_dispatch_kind_filter() : "all";
-    const bool nearby = armed && armed_kind_filter != "farm";
+    const std::string armed_kind_filter = route ? "farm" : armed ? read_dispatch_kind_filter() : "all";
+    const bool nearby = route || (armed && armed_kind_filter != "farm");
     if (nearby) update_nearby_location(now_ms());
-    const bool nearby_ready = nearby_location_gate.ready(steady_ms());
+    const bool nearby_ready = dispatch_location_ready(route);
     for (auto it = nearby_selections.begin(); it != nearby_selections.end();) {
-        if (!nearby || !nearby_ready || it->second.location_epoch != nearby_location_gate.epoch()
+        if (!nearby || !nearby_ready || it->second.location_epoch != dispatch_location_epoch(route)
                 || steady_ms()-it->second.since > 20000) {
             nearby_block("nearby-selection-reset", it->second.kind.c_str(), it->first, 0, it->second.team.size());
             dispatch_reservations.cancel(it->first);
@@ -1339,9 +1390,9 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                         ? distance_metres(nearby_fix.game_lat, nearby_fix.game_lng, latitude, longitude) : -1;
                 const bool safe = requested && can_start && power && same_team && !gift_pikmin_unavailable
                         && pikmin::nearby_duration_safe(live_duration) && start_expedition
-                        && nearby_location_gate.ready(steady_ms()) && selection.location_epoch == nearby_location_gate.epoch()
-                        && pikmin::dispatch_distance_allowed(true, false, live_distance) && read_dispatch_mode() == "armed"
-                        && read_dispatch_kind_filter() == armed_kind_filter
+                        && dispatch_location_ready(route) && selection.location_epoch == dispatch_location_epoch(route)
+                        && pikmin::dispatch_distance_allowed(true, false, live_distance) && read_dispatch_mode() == dispatch_mode
+                        && (route || read_dispatch_kind_filter() == armed_kind_filter)
                         && pikmin::nearby_kind_allowed(armed_kind_filter, read_nearby_selection(), kind)
                         && starts_requested < static_cast<int>(kArmedMaxStartsPerScan)
                         && armed_dispatches.size() < kArmedMaxInFlight;
@@ -1464,7 +1515,7 @@ void write_dispatch_candidates(void *list, long long observed_ms) {
                     } else if (nearby) {
                         if (original_get_expedition_total_duration_ms && pikmin::nearby_duration_safe(game_duration)
                                 && get_expedition_has_enough_carrying_power) {
-                            nearby_selections.emplace(id_text, NearbySelection{kind, selected_team, steady_ms(), nearby_location_gate.epoch()});
+                            nearby_selections.emplace(id_text, NearbySelection{kind, selected_team, steady_ms(), dispatch_location_epoch(route)});
                             append_dispatch_history("nearby-selection-settling", kind, id_text, game_duration, picked_count);
                         } else nearby_block("nearby-duration-blocked", kind, id_text, game_duration, picked_count);
                     } else {
@@ -1763,7 +1814,7 @@ void write_return_candidates(void *items, int count, long long now) {
 void dry_run_return_tasks() {
     const long long now = now_ms();
     static long long last_dispatch_scan_ms{};
-    const bool walking = read_dispatch_mode() == "armed" && read_dispatch_kind_filter() != "farm";
+    const bool walking = read_dispatch_mode() == "route" || (read_dispatch_mode() == "armed" && read_dispatch_kind_filter() != "farm");
     const bool dispatch_due = now-last_dispatch_scan_ms >= (walking ? 1000 : 5000);
     const bool return_due = now-last_return_dry_run_ms >= 5000;
     if (!dispatch_due && !return_due) return;
@@ -2306,6 +2357,19 @@ void initialize_runtime_metadata() {
     runtime_metadata_ready = true;
     install_return_diagnostic_hook();
     install_dispatch_wire_probe();
+    // Resolve from the exact live RpcManager type; old reference/dump.cs is not v152.
+    void *rpc=find_class("Niantic.Ichigo.Rpc","RpcManager");
+    void *login=rpc?class_get_method_from_name(rpc,"OnLoggedIn",3):nullptr;
+    void *logout=rpc?class_get_method_from_name(rpc,"OnLoggedOut",0):nullptr;
+    void *login_entry=login?*reinterpret_cast<void **>(login):nullptr;
+    void *logout_entry=logout?*reinterpret_cast<void **>(logout):nullptr;
+    Dl_info li{},lo{};
+    if(login_entry&&logout_entry&&dladdr(login_entry,&li)&&dladdr(logout_entry,&lo)
+            &&li.dli_fbase==lo.dli_fbase
+            &&reinterpret_cast<uintptr_t>(login_entry)-reinterpret_cast<uintptr_t>(li.dli_fbase)==kRpcManagerLoggedInRva){
+        A64HookFunction(logout_entry,reinterpret_cast<void *>(hooked_logged_out),reinterpret_cast<void **>(&original_logged_out));
+        std::lock_guard<std::mutex> lock(identity_mutex);identity_logout_hook_ready=original_logged_out!=nullptr;
+    }
     LOGI("[NECTAR] post-login IL2CPP metadata installed");
 }
 
@@ -2448,6 +2512,10 @@ void maybe_dismiss_planting_result_dialog() {
     if (planting_result_dialog_seen_ms < planting_result_stop_requested_ms || now < planting_result_close_after_ms) return;
     void *task = close_planting_result_dialog(planting_result_dialog, nullptr);
     if (task && gchandle_new) gchandle_new(task, false);
+    if(route_stop_started && !route_stop_token.empty()) {
+        route_close_task=task;
+        if(task && gchandle_new)route_close_handle=gchandle_new(task,false);
+    }
     LOGI("[PLANTING-CONTROL] auto-dismissed owned result dialog task=%p", task);
     planting_result_auto_close_pending = false;
 }
@@ -2479,8 +2547,16 @@ bool flower_farm_session_active() {
 
 void maybe_manage_planting() {
     maybe_dismiss_planting_result_dialog();
-    const std::string mode = read_planting_control_mode();
+    const auto lease=route_lease();
+    if(lease.valid())route_session_owned=true;
+    const bool takeover=lease.valid()&&lease.phase=="prepare";
+    if(takeover && route_stop_token!=lease.token) {
+        route_stop_token=lease.token;route_stop_started=false;route_close_task=nullptr;route_close_handle=0;
+        planting_control_stop_attempted=false;
+    }
+    const std::string mode = takeover || (route_session_owned&&!lease.valid()) ? "off" : read_planting_control_mode();
     const bool planting = is_planting();
+    if(route_session_owned&&!lease.valid()&&!planting&&!planting_result_auto_close_pending)route_session_owned=false;
     if (mode != planting_control_last_mode) {
         planting_control_last_mode = mode;
         planting_control_start_attempted = false;
@@ -2528,7 +2604,8 @@ void maybe_manage_planting() {
         write_planting_control_status(mode, false, planting_control_last_action.c_str());
         return;
     }
-    if (mode == "off" && planting_control_owned && planting && !planting_control_stop_attempted) {
+    if (mode == "off" && (planting_control_owned || (takeover&&!route_stop_started)) && planting && !planting_control_stop_attempted) {
+        if(route_session_owned){route_stop_started=true;route_close_task=nullptr;route_close_handle=0;}
         void *task = stop_planting_with_confirmation(planting_controller, false, nullptr);
         if (task && gchandle_new) {
             planting_control_pending_task = task;
@@ -2629,6 +2706,19 @@ pikmin::NearbyFix read_nearby_game_fix() {
 void update_nearby_location(long long wall) {
     nearby_fix = read_nearby_game_fix();
     nearby_location_gate.observe(nearby_fix, nearby_elapsed_ms(), steady_ms());
+    auto lease=route_lease();
+    if(lease.token!=route_gate_token){route_location_gate.reset();route_gate_token=lease.token;}
+    if(lease.valid())route_location_gate.observe(nearby_fix,nearby_elapsed_ms());else route_location_gate.reset();
+    const bool stop_ok=planting_controller&&stop_planting_with_confirmation&&close_planting_result_dialog
+        &&!is_planting()&&!planting_result_auto_close_pending
+        &&(!route_stop_started||(route_close_task&&task_is_completed&&task_is_faulted
+            &&task_is_completed(route_close_task,nullptr)&&!task_is_faulted(route_close_task,nullptr)));
+    const std::string route_tmp=std::string(route_status_path)+".tmp";
+    if(FILE *f=std::fopen(route_tmp.c_str(),"w")) {
+        bool ok=std::fprintf(f,"v1\t%lld\t%d\t%s\t%s\t%d\t%d\t300000\n",wall,getpid(),lease.valid()?lease.token.c_str():"-",
+            lease.valid()?lease.phase.c_str():"off",stop_ok?1:0,route_location_gate.ready(nearby_elapsed_ms())?1:0)>0;
+        bool closed=std::fclose(f)==0;if(ok&&closed&&chmod(route_tmp.c_str(),0644)==0)std::rename(route_tmp.c_str(),route_status_path);
+    }
     const std::string temp = std::string(nearby_gate_status_path) + ".tmp";
     if (FILE *file = std::fopen(temp.c_str(), "w")) {
         std::fprintf(file, "v2\t%lld\t%d\t%s\t%llu\t%u\t%.7f\t%.7f\t%.7f\t%.7f\t%lld\t%lld\n",
@@ -2945,8 +3035,9 @@ void maybe_claim() {
     const long long current = now_ms();
     if (current - last_tick_ms < 1000) return;
     last_tick_ms = current;
+    write_identity(current);
     if (FILE *runtime = std::fopen((std::string(core_runtime_path)+".tmp").c_str(), "w")) {
-        const bool written = std::fprintf(runtime, "v1\t%lld\t%d\t1.4.29\t63\t152.0\n", current, getpid()) > 0;
+        const bool written = std::fprintf(runtime, "v1\t%lld\t%d\t1.4.33\t67\t152.0\n", current, getpid()) > 0;
         const bool closed = std::fclose(runtime) == 0;
         const std::string tmp = std::string(core_runtime_path)+".tmp";
         if (written && closed && chmod(tmp.c_str(),0644)==0) std::rename(tmp.c_str(),core_runtime_path);
@@ -3097,16 +3188,35 @@ void hooked_flower_model_updated(void *self, void *method_info) {
     maybe_return_tasks();
 }
 void hooked_rpc_manager_constructor(void *self, void *method_info) {
+    invalidate_identity();
     if (original_rpc_manager_constructor) original_rpc_manager_constructor(self, method_info);
     rpc_manager = self;
     LOGI("[NECTAR-DIAG] RpcManager constructed this=%p", self);
 }
 void hooked_rpc_manager_logged_in(void *self, void *server_url, void *player_id,
                                   void *background_token, void *method_info) {
+    invalidate_identity();
+    ScopedManagedRoot player_root(player_id,gchandle_new,gchandle_free);
     rpc_manager = self;
     LOGI("[NECTAR-DIAG] RpcManager logged in this=%p", self);
     if (original_rpc_manager_logged_in) original_rpc_manager_logged_in(self, server_url, player_id, background_token, method_info);
     initialize_runtime_metadata();
+    void *string_class=find_class("System","String");
+    const bool string_ok=player_id&&string_class&&object_get_class(player_id)==string_class;
+    std::string canonical;
+    int id_units=0;
+    if(player_root.handle&&string_ok){
+        const auto *s=static_cast<Il2CppStringLayout *>(player_id);id_units=s->length;
+        if(id_units>0&&id_units<=256)for(int i=0;i<id_units;++i){
+            canonical.push_back(static_cast<char>(s->chars[i]&255));
+            canonical.push_back(static_cast<char>(s->chars[i]>>8));
+        }
+    }
+    const auto digest=pikmin::account_digest(canonical);
+    {std::lock_guard<std::mutex> lock(identity_mutex);if(identity_logout_hook_ready)identity_hash=digest;}
+    LOGI("[SESSION-CHECK] logoutHook=%d rooted=%d stringType=%d units=%d digestReady=%d",
+         identity_logout_hook_ready?1:0,player_root.handle?1:0,string_ok?1:0,id_units,digest.empty()?0:1);
+    write_identity(now_ms());
 }
 void hooked_register_map_object(void *self, void *map_object, int tag, void *method_info) {
     if (original_register_map_object) original_register_map_object(self, map_object, tag, method_info);
@@ -3139,6 +3249,7 @@ std::string read_dispatch_mode() {
     char value[16]{};
     std::fgets(value, sizeof(value), file);
     std::fclose(file);
+    if (std::strcmp(value,"route\n")==0 || std::strcmp(value,"route")==0) return route_lease().phase=="walk"?"route":"off";
     if (std::strncmp(value, "armed", 5) == 0) return "armed";
     return std::strncmp(value, "batch", 5) == 0 ? "batch" : "off";
 }
@@ -3420,10 +3531,13 @@ void maybe_return_tasks() {
     feeding_probe::tick();
 }
 
+#include "planting_reward.inc"
+
 void hooked_map_update(void *self, void *method_info) {
     if (original_map_update) original_map_update(self, method_info);
     maybe_claim();
     maybe_return_tasks();
+    maybe_collect_planting_reward();
 }
 void hooked_planting_result_dialog_start(void *self, void *method_info) {
     if (original_planting_result_dialog_start) original_planting_result_dialog_start(self, method_info);
@@ -3444,6 +3558,7 @@ void *hooked_maybe_show_speed_warning(void *self, void *method_info) {
 void hooked_planting_init(void *self, void *method_info) {
     if (original_planting_init) original_planting_init(self, method_info);
     planting_controller = self;
+    install_planting_reward_hook();
     if (self && !planting_controller_metadata_logged && object_get_class) {
         planting_controller_metadata_logged = true;
         void *klass = object_get_class(self);
@@ -3536,6 +3651,8 @@ void start(const char *game_data_dir) {
     string_new = reinterpret_cast<StringNew>(xdl_sym(handle, "il2cpp_string_new", nullptr));
     gchandle_new = reinterpret_cast<GcHandleNew>(xdl_sym(handle, "il2cpp_gchandle_new", nullptr));
     gchandle_free = reinterpret_cast<GcHandleFree>(xdl_sym(handle, "il2cpp_gchandle_free", nullptr));
+    reward_invoke = reinterpret_cast<RewardInvoke>(xdl_sym(handle, "il2cpp_runtime_invoke", nullptr));
+    reward_unbox = reinterpret_cast<RewardUnbox>(xdl_sym(handle, "il2cpp_object_unbox", nullptr));
     planter_engine::configure(handle, game_data_dir);
     feeding_probe::configure(handle, game_data_dir);
     gc_write_barrier = reinterpret_cast<GcWriteBarrier>(xdl_sym(handle, "il2cpp_gc_wbarrier_set_field", nullptr));
@@ -3565,6 +3682,8 @@ void start(const char *game_data_dir) {
     std::snprintf(return_batch_limit_path, sizeof(return_batch_limit_path), "/data/local/tmp/pikmin-return-batch-limit.txt");
     std::snprintf(compatibility_path, sizeof(compatibility_path), "%s/files/compatibility_status.tsv", game_data_dir);
     std::snprintf(core_runtime_path, sizeof(core_runtime_path), "%s/files/core_runtime.tsv", game_data_dir);
+    std::snprintf(identity_path, sizeof(identity_path), "%s/files/automation_session.tsv", game_data_dir);
+    std::snprintf(route_status_path, sizeof(route_status_path), "%s/files/route_status.tsv", game_data_dir);
     std::snprintf(dispatch_candidates_path, sizeof(dispatch_candidates_path), "%s/files/dispatch_candidates.tsv", game_data_dir);
     std::snprintf(dispatch_availability_path, sizeof(dispatch_availability_path), "%s/files/dispatch_availability.tsv", game_data_dir);
     std::snprintf(dispatch_status_path, sizeof(dispatch_status_path), "%s/files/dispatch_probe_status.tsv", game_data_dir);
